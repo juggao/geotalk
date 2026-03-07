@@ -1489,6 +1489,7 @@ class GeoTalk:
         self.active      = None   # current TX channel key
         self.mcast       = MulticastSocket(port, local_if=local_if,
                                            debug=debug)
+        self._glob_socks : dict[str, list[str]] = {}  # wildcard key → [exact keys]
         self.relay       = RelayTransport()
         self.audio       = AudioEngine()
         self._running    = False
@@ -1501,6 +1502,58 @@ class GeoTalk:
         return bool(self.relay_host)
 
     # ── channel ops ───────────────────────────────────────────────────────────
+
+    # ── multicast group helpers ──────────────────────────────────────────────
+
+    def _join_mcast_groups(self, key: str, pat: ChannelPattern):
+        """
+        Join the multicast group(s) for a channel pattern.
+
+        Exact channel  → one socket on that channel's group.
+        Wildcard/regex → one socket on the pattern's own group (GLOB:59**)
+                         PLUS one socket per enumerated concrete code
+                         (5900, 5901, … 5999) so packets from peers on exact
+                         channels are received.  All RX threads feed into the
+                         same parent channel key so CHARLIE sees everything
+                         in his #59** channel window.
+        """
+        def _start_rx(sock, hint_key):
+            t = threading.Thread(target=self._rx_loop_mcast,
+                                 args=(key, sock),
+                                 kwargs={"hint_key_override": hint_key},
+                                 daemon=True,
+                                 name=f"rx-{hint_key[:20]}")
+            self._rx_threads[hint_key] = t
+            t.start()
+
+        # Always join the pattern's own group
+        sock = self.mcast.join(key)
+        _start_rx(sock, key)
+
+        if pat.kind == "exact":
+            return   # nothing more to do
+
+        # Wildcard/regex: enumerate concrete codes and join each group
+        sub_keys: list[str] = []
+        for code in _enumerate_glob(pat, SCAN_MAX_CANDIDATES):
+            if code == key:
+                continue   # already joined above
+            try:
+                sock = self.mcast.join(code)
+                _start_rx(sock, code)
+                sub_keys.append(code)
+            except OSError:
+                pass   # port already in use (another channel has same hash) — skip
+        self._glob_socks[key] = sub_keys
+        self.mcast._dbg(
+            f"wildcard join #{pat.display()} → {1 + len(sub_keys)} groups")
+
+    def _leave_mcast_groups(self, key: str):
+        """Leave the multicast group(s) for a channel key."""
+        self.mcast.leave(key)
+        for sub_key in self._glob_socks.pop(key, []):
+            self.mcast.leave(sub_key)
+            self._rx_threads.pop(sub_key, None)
 
     def join_channel(self, raw: str) -> str:
         try:
@@ -1518,24 +1571,32 @@ class GeoTalk:
             self.active = key
 
         if self.relay_mode:
-            # Relay path: subscribe on relay; a single shared relay-rx thread
-            # handles all inbound traffic (started in start()).
+            # Relay path: subscribe the glob key AND all enumerated concrete
+            # keys so the relay fans out packets from exact-channel peers
+            # (e.g. BOB on #5912) to CHARLIE who joined #591*.
             self.relay.subscribe(self.nick, key)
+            sub_keys: list[str] = []
+            if pat.kind != "exact":
+                for code in _enumerate_glob(pat, SCAN_MAX_CANDIDATES):
+                    if code != key:
+                        self.relay.subscribe(self.nick, code)
+                        sub_keys.append(code)
+                self._glob_socks[key] = sub_keys
             self.relay.send(encode_ping(self.nick, key))
         else:
-            # Multicast path: one socket + thread per channel.
-            sock = self.mcast.join(key)
-            t = threading.Thread(target=self._rx_loop_mcast,
-                                 args=(key, sock),
-                                 daemon=True, name=f"rx-{key[:20]}")
-            self._rx_threads[key] = t
-            t.start()
+            # Multicast path: join the pattern's own group AND, for wildcards,
+            # all enumerated concrete groups so packets from exact-channel peers
+            # (e.g. BOB on #5912) are received when CHARLIE joins #59**.
+            self._join_mcast_groups(key, pat)
             self.mcast.send(key, encode_ping(self.nick, key))
 
         region_line = expand_wildcard_info(pat)
-        transport   = (f"relay={self.relay.relay_addr_str()}"
-                       if self.relay_mode
-                       else f"mcast={ch.multicast}:{ch.port}")
+        n_extra     = len(self._glob_socks.get(key, []))
+        extra       = f" + {n_extra} sub-channels" if n_extra else ""
+        if self.relay_mode:
+            transport = f"relay={self.relay.relay_addr_str()}{extra}"
+        else:
+            transport = f"mcast={ch.multicast}:{ch.port}{extra}"
         return (f"{GR}Joined #{pat.display()}{R}  "
                 f"→ {transport}\n{region_line}")
 
@@ -1557,8 +1618,10 @@ class GeoTalk:
 
         if self.relay_mode:
             self.relay.unsubscribe(self.nick, key)
+            for sub_key in self._glob_socks.pop(key, []):
+                self.relay.unsubscribe(self.nick, sub_key)
         else:
-            self.mcast.leave(key)
+            self._leave_mcast_groups(key)
 
         if self.active == key:
             self.active = next(iter(self.channels), None)
@@ -1611,11 +1674,72 @@ class GeoTalk:
         self._send(self.active, pkt)
 
     def _send(self, key: str, data: bytes):
-        """Route a packet to relay or multicast depending on mode."""
-        if self.relay_mode:
-            self.relay.send(data)
-        else:
-            self.mcast.send(key, data)
+        """
+        Route a packet to relay or multicast.
+
+        Wildcard channels (GLOB:591*, GLOB:59**, …)
+        ────────────────────────────────────────────
+        The `p` field in the packet JSON names the sending channel.  Both the
+        relay and multicast peers dispatch inbound packets by looking up the
+        `p` field against their subscriptions.  BOB subscribed to #5912, not
+        GLOB:591*, so a packet with p=GLOB:591* is invisible to him.
+
+        Fix: re-encode the packet for each sub-key with that sub-key's `p`
+        field and send each copy separately.  The relay then fans each one out
+        to the right subscribers; in multicast mode each copy goes to the right
+        multicast group.
+
+        The GLOB key itself is still sent so peers who joined the same glob
+        pattern (e.g. another CHARLIE on #591*) also receive the message.
+        """
+        sub_keys = self._glob_socks.get(key)   # None for exact channels
+
+        if not sub_keys:
+            # Exact channel or no sub-keys — single send as before
+            if self.relay_mode:
+                self.relay.send(data)
+            else:
+                self.mcast.send(key, data)
+            return
+
+        # Wildcard channel: send once per sub-key with rewritten `p` field,
+        # plus once on the glob key itself.
+        all_keys = [key] + sub_keys
+
+        # Parse the packet to extract the JSON header so we can rewrite `p`
+        # Format: MAGIC(2) + type(1) + len(2) + JSON + optional PCM tail
+        if len(data) < 5 or data[:2] != MAGIC:
+            # Malformed or non-standard packet — fall back to single send
+            if self.relay_mode:
+                self.relay.send(data)
+            else:
+                self.mcast.send(key, data)
+            return
+
+        pkt_type = data[2]
+        json_len = struct.unpack("!H", data[3:5])[0]
+        json_bytes = data[5:5 + json_len]
+        tail = data[5 + json_len:]   # PCM for audio packets, empty otherwise
+
+        try:
+            payload = json.loads(json_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if self.relay_mode:
+                self.relay.send(data)
+            else:
+                self.mcast.send(key, data)
+            return
+
+        for send_key in all_keys:
+            payload["p"] = send_key
+            new_json = json.dumps(payload, separators=(",", ":")).encode()
+            new_pkt  = (MAGIC + bytes([pkt_type])
+                        + struct.pack("!H", len(new_json))
+                        + new_json + tail)
+            if self.relay_mode:
+                self.relay.send(new_pkt)
+            else:
+                self.mcast.send(send_key, new_pkt)
 
     # ── PTT ───────────────────────────────────────────────────────────────────
 
@@ -1717,17 +1841,32 @@ class GeoTalk:
 
     # ── RX loops ──────────────────────────────────────────────────────────────
 
-    def _rx_loop_mcast(self, key: str, sock: socket.socket):
-        """Per-channel multicast receive thread."""
-        while key in self.channels and self._running:
+    def _rx_loop_mcast(self, key: str, sock: socket.socket,
+                       hint_key_override: str | None = None):
+        """
+        Per-channel multicast receive thread.
+
+        key              — the channel key this socket was opened for (used to
+                           check whether the channel is still joined)
+        hint_key_override — when a sub-group socket is used for a wildcard
+                           channel, this is the sub-group's exact key (e.g.
+                           "5912").  The parent wildcard key is `key`.
+                           _dispatch_packet receives hint_key=override so it
+                           knows which exact group the packet arrived on, but
+                           the thread keeps running as long as the parent
+                           wildcard channel (key) is still joined.
+        """
+        parent_key = key   # the channel whose lifetime governs this thread
+        hint_key   = hint_key_override or key
+        while parent_key in self.channels and self._running:
             try:
                 data, addr = sock.recvfrom(BUFFER_SIZE)
             except socket.timeout:
                 continue
             except OSError:
                 break
-            self.mcast.log_rx(key, addr, len(data))
-            self._dispatch_packet(data, addr, hint_key=key)
+            self.mcast.log_rx(hint_key, addr, len(data))
+            self._dispatch_packet(data, addr, hint_key=hint_key)
 
     def _relay_packet_cb(self, data: bytes, addr: tuple):
         """Called by RelayTransport for every inbound relay packet."""
