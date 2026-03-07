@@ -969,7 +969,20 @@ class AudioEngine:
 
         if AUDIO_AVAILABLE:
             try:
-                self.pa = pyaudio.PyAudio()
+                # PyAudio probes every ALSA device on init, which spews
+                # harmless "unable to open slave" / "Unknown PCM" messages
+                # to stderr.  Suppress fd-level stderr during init so the
+                # terminal stays clean.  Audio itself is unaffected.
+                import os as _os
+                devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+                saved_stderr_fd = _os.dup(2)
+                _os.dup2(devnull_fd, 2)
+                try:
+                    self.pa = pyaudio.PyAudio()
+                finally:
+                    _os.dup2(saved_stderr_fd, 2)
+                    _os.close(saved_stderr_fd)
+                    _os.close(devnull_fd)
             except Exception:
                 self.pa = None
 
@@ -2308,13 +2321,13 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 BANNER = f"""
-{B}{CY}  ██████╗ ███████╗ ██████╗ ████████╗ █████╗ ██╗     ██╗  ██╗{R}
-{B}{CY}  ██╔══██╗██╔════╝██╔═══██╗╚══██╔══╝██╔══██╗██║     ██║ ██╔╝{R}
-{B}{CY}  ██║  ███████╗██║   ██║   ██║   ███████║██║     █████╔╝ {R}
-{B}{CY}  ██║  ╚════██║██║   ██║   ██║   ██╔══██║██║     ██╔═██╗ {R}
-{B}{CY}  ██████╔╝███████║╚██████╔╝   ██║   ██║  ██║███████╗██║  ██╗{R}
-{B}{CY}  ╚═════╝ ╚══════╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝{R}
-{DM}  Geo-grouped pseudo-HAM radio & text  •  v{VERSION}{R}
+{B}{CY}   ██████╗  ███████╗  ██████╗  ████████╗  █████╗  ██╗      ██╗  ██╗{R}
+{B}{CY}  ██╔════╝  ██╔════╝ ██╔═══██╗ ╚══██╔══╝ ██╔══██╗ ██║      ██║ ██╔╝{R}
+{B}{CY}  ██║  ███╗ █████╗   ██║   ██║    ██║    ███████║ ██║      █████╔╝ {R}
+{B}{CY}  ██║   ██║ ██╔══╝   ██║   ██║    ██║    ██╔══██║ ██║      ██╔═██╗ {R}
+{B}{CY}  ╚██████╔╝ ███████╗ ╚██████╔╝    ██║    ██║  ██║ ███████╗ ██║  ██╗{R}
+{B}{CY}   ╚═════╝  ╚══════╝  ╚═════╝     ╚═╝    ╚═╝  ╚═╝ ╚══════╝ ╚═╝  ╚═╝{R}
+{DM}  📡  Geo-grouped pseudo-HAM radio & text  •  v{VERSION}{R}
   Type {YL}/help{R} for commands  •  {YL}#59**{R} Venlo  •  {YL}#1***??{R} Amsterdam
 """
 
