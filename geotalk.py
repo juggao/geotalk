@@ -37,18 +37,25 @@ try:
 except ImportError:
     AUDIO_AVAILABLE = False
 
+try:
+    import opuslib
+    OPUS_AVAILABLE = True
+except ImportError:
+    OPUS_AVAILABLE = False
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "1.5.0"
+VERSION      = "1.6.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
-BUFFER_SIZE    = 4096
-AUDIO_CHUNK    = 1024
-AUDIO_RATE     = 16000         # 16 kHz mono — narrow-band voice quality
+BUFFER_SIZE    = 65536
+AUDIO_CHUNK    = 960           # Opus 20 ms frame @ 48 kHz
+AUDIO_RATE     = 48000         # 48 kHz — native Opus rate; falls back to PCM
 AUDIO_CHANNELS = 1
 AUDIO_FORMAT   = 8             # pyaudio.paInt16 = 8
+OPUS_BITRATE   = 32000         # 32 kbit/s (~80 B/frame)
 
 # Packet types
 PKT_TEXT     = 0x01
@@ -564,11 +571,14 @@ def encode_text(nick: str, postal: str, text: str, msg_id: int = 0) -> bytes:
                           "ts": int(time.time())}).encode()
     return MAGIC + bytes([PKT_TEXT]) + struct.pack("!H", len(payload)) + payload
 
-def encode_audio(nick: str, postal: str, seq: int, pcm: bytes) -> bytes:
-    header = json.dumps({"n": nick, "p": postal, "s": seq}).encode()
+def encode_audio(nick: str, postal: str, seq: int, audio: bytes,
+                 codec: str = "opus") -> bytes:
+    # codec: "opus" (compressed) or "pcm" (raw int16 LE fallback)
+    header = json.dumps({"n": nick, "p": postal, "s": seq,
+                         "codec": codec}).encode()
     hlen   = struct.pack("!H", len(header))
-    alen   = struct.pack("!H", len(pcm))
-    return MAGIC + bytes([PKT_AUDIO]) + hlen + header + alen + pcm
+    alen   = struct.pack("!H", len(audio))
+    return MAGIC + bytes([PKT_AUDIO]) + hlen + header + alen + audio
 
 def encode_ping(nick: str, postal: str) -> bytes:
     payload = json.dumps({"n": nick, "p": postal,
@@ -625,11 +635,11 @@ def decode_packet(data: bytes) -> dict | None:
 
     if ptype == PKT_AUDIO:
         try:
-            hdr  = json.loads(body[:plen])
-            rest = body[plen:]
-            alen = struct.unpack("!H", rest[:2])[0]
-            pcm  = rest[2:2 + alen]
-            return {"type": "audio", **hdr, "pcm": pcm}
+            hdr   = json.loads(body[:plen])
+            rest  = body[plen:]
+            alen  = struct.unpack("!H", rest[:2])[0]
+            audio = rest[2:2 + alen]
+            return {"type": "audio", **hdr, "audio": audio}
         except Exception:
             return None
 
@@ -964,17 +974,24 @@ class AudioEngine:
 
     Mixing
     ──────
-    Each remote sender gets its own ring buffer (deque of PCM chunks).
+    Each remote sender gets its own ring buffer (deque of decoded PCM chunks).
     A dedicated mixer thread wakes every AUDIO_CHUNK/AUDIO_RATE seconds
-    (one frame period, ~64 ms at 16 kHz / 1024 samples).  It grabs the
-    oldest chunk from every active sender, converts to int16 arrays, sums
-    them sample-by-sample with saturation clipping to ±32767, and writes
-    the single mixed frame to the output stream.
+    (~20 ms at 48 kHz / 960 samples).  It grabs one chunk per active sender,
+    sums int16 samples with saturation clipping to ±32767, and writes the
+    single mixed frame to the output stream.
 
     Senders that have not delivered a chunk within MIXER_SENDER_TIMEOUT
     seconds are considered silent and skipped.  This handles the common
     case where Alice stops talking before the mixer tick — her buffer goes
     empty, only Bob's audio is mixed, and there is no glitch.
+
+    Codec
+    ─────
+    When opuslib is available, mic audio is Opus-encoded before transmission
+    and decoded on receipt.  At 48 kHz / 960 samples / 32 kbit/s each packet
+    is ~80 bytes vs ~1920 bytes raw PCM — a ~24x reduction.  Falls back to
+    raw int16 PCM if opuslib is not installed; the "codec" JSON field allows
+    both modes to interoperate seamlessly.
     """
 
     # How many chunks to buffer per sender before dropping (back-pressure)
@@ -982,26 +999,24 @@ class AudioEngine:
     # Seconds after last packet before a sender is evicted from the mixer
     SENDER_TIMEOUT     = 2.0
     # Mixer tick interval — should match one frame period
-    MIXER_TICK         = AUDIO_CHUNK / AUDIO_RATE   # ~0.064 s
+    MIXER_TICK         = AUDIO_CHUNK / AUDIO_RATE   # ~0.020 s at 48 kHz
 
     def __init__(self):
-        self.pa        = None
-        self._ptt      = False
-        self._muted    = False
-        self._running  = False
-        self._tx_cb    = None   # called with (pcm_bytes, seq)
-        self._seq      = 0
+        self.pa          = None
+        self._opus_enc   = None   # opuslib.Encoder  (None if unavailable)
+        self._opus_dec   = None   # opuslib.Decoder  (None if unavailable)
+        self._ptt        = False
+        self._muted      = False
+        self._running    = False
+        self._tx_cb      = None   # called with (audio_bytes, seq)
+        self._seq        = 0
 
-        # Per-sender state  {nick: {"buf": deque, "last": float}}
+        # Per-sender state  {nick: {"buf": deque[pcm_bytes], "last": float}}
         self._senders: dict[str, dict] = {}
         self._sender_lock = threading.Lock()
 
         if AUDIO_AVAILABLE:
             try:
-                # PyAudio probes every ALSA device on init, which spews
-                # harmless "unable to open slave" / "Unknown PCM" messages
-                # to stderr.  Suppress fd-level stderr during init so the
-                # terminal stays clean.  Audio itself is unaffected.
                 import os as _os
                 devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
                 saved_stderr_fd = _os.dup(2)
@@ -1015,11 +1030,26 @@ class AudioEngine:
             except Exception:
                 self.pa = None
 
+        if OPUS_AVAILABLE:
+            try:
+                self._opus_enc = opuslib.Encoder(
+                    AUDIO_RATE, AUDIO_CHANNELS, opuslib.APPLICATION_VOIP)
+                self._opus_enc.bitrate = OPUS_BITRATE
+                self._opus_dec = opuslib.Decoder(AUDIO_RATE, AUDIO_CHANNELS)
+            except Exception:
+                self._opus_enc = None
+                self._opus_dec = None
+
+    @property
+    def codec(self) -> str:
+        """Active codec name — 'opus' if opuslib is available, else 'pcm'."""
+        return "opus" if self._opus_enc else "pcm"
+
     def start(self, tx_callback):
-        """tx_callback(pcm, seq) is called for each captured chunk."""
+        """tx_callback(audio_bytes, seq) — called for each captured frame."""
         if not self.pa:
             return
-        self._tx_cb  = tx_callback
+        self._tx_cb   = tx_callback
         self._running = True
         self._rx_stream = self.pa.open(
             format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
@@ -1037,7 +1067,14 @@ class AudioEngine:
     def _capture_cb(self, in_data, frame_count, time_info, status):
         import pyaudio as _pa
         if self._ptt and self._tx_cb:
-            self._tx_cb(in_data, self._seq)
+            if self._opus_enc:
+                try:
+                    audio = self._opus_enc.encode(in_data, AUDIO_CHUNK)
+                except Exception:
+                    audio = in_data   # fallback to raw PCM on encode error
+            else:
+                audio = in_data       # no opuslib — send raw PCM
+            self._tx_cb(audio, self._seq)
             self._seq += 1
         return (None, _pa.paContinue)
 
@@ -1123,15 +1160,24 @@ class AudioEngine:
     def is_muted(self) -> bool:
         return self._muted
 
-    def feed_audio(self, pcm: bytes, nick: str = ""):
+    def feed_audio(self, audio: bytes, nick: str = "", codec: str = "pcm"):
         """
-        Deliver a PCM chunk from `nick` into that sender's ring buffer.
-        The mixer thread will pick it up on the next tick.
+        Deliver an audio frame from `nick` into that sender's PCM ring buffer.
+        Opus frames are decoded to raw int16 PCM before buffering so the mixer
+        always works with PCM regardless of the sender's codec.
         """
         if self._muted:
             return
         if not nick:
             nick = "_unknown_"
+        # Decode Opus → PCM before buffering
+        if codec == "opus" and self._opus_dec:
+            try:
+                pcm = self._opus_dec.decode(audio, AUDIO_CHUNK)
+            except Exception:
+                return   # drop corrupted frame rather than pass noise to mixer
+        else:
+            pcm = audio  # raw PCM (legacy peer or opuslib not installed)
         with self._sender_lock:
             if nick not in self._senders:
                 self._senders[nick] = {
@@ -1776,10 +1822,11 @@ class GeoTalk:
         ts = datetime.now().strftime("%H:%M")
         return f"{DM}{ts}{R} {B}{GR}[{self.nick}]{R} → {B}{CY}#{display}{R}: {text}"
 
-    def send_audio_chunk(self, pcm: bytes, seq: int):
+    def send_audio_chunk(self, audio: bytes, seq: int):
         if not self.active:
             return
-        pkt = encode_audio(self.nick, self.active, seq, pcm)
+        pkt = encode_audio(self.nick, self.active, seq, audio,
+                           codec=self.audio.codec)
         self._send(self.active, pkt)
 
     def _send(self, key: str, data: bytes):
@@ -2138,7 +2185,8 @@ class GeoTalk:
         elif pkt["type"] == "audio":
             if self._ptt_held:
                 return   # we are transmitting — discard incoming audio from others
-            self.audio.feed_audio(pkt.get("pcm", b""), nick=nick)
+            self.audio.feed_audio(pkt.get("audio", b""), nick=nick,
+                                   codec=pkt.get("codec", "pcm"))
             if not self.audio.is_muted:
                 sys.stdout.write(
                     f"\r{DM}{ts}{R} {MG}[VOICE]{R} "
@@ -2416,27 +2464,82 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
 
         if cmd0 == "info":
             lines = [f"{B}GeoTalk {VERSION}{R}  nick={GR}{gt.nick}{R}"]
+
+            # ── transport ────────────────────────────────────────────────────
             lines.append(f"  Port base : {gt.port}")
             lines.append(f"  Interface : {gt.local_if}  "
                          f"{DM}(0.0.0.0 = OS default){R}")
-            lines.append(f"  Audio     : {'available' if AUDIO_AVAILABLE and gt.audio.pa else 'unavailable'}")
             if gt.relay_mode:
                 conn = f"{GR}connected{R}" if gt.relay.is_connected() \
                        else f"{RD}disconnected{R}"
-                lines.append(f"  Relay     : {gt.relay_host}:{gt.relay_port}  [{conn}]")
-                lines.append(f"  Transport : {CY}relay (unicast UDP){R}")
+                lines.append(f"  Transport : {CY}relay (unicast UDP){R}  "
+                             f"{gt.relay_host}:{gt.relay_port}  [{conn}]")
             else:
-                lines.append(f"  Transport : {CY}multicast UDP{R}")
-            for k, ch in gt.channels.items():
-                region = _lookup_region(ch.pattern.source) if ch.pattern.kind == "exact" \
-                         else ch.pattern.region_info().split(";")[0]
-                if gt.relay_mode:
-                    net = f"relay={gt.relay.relay_addr_str()}"
-                else:
-                    net = f"mcast={ch.multicast}:{ch.port}"
-                lines.append(f"  #{ch.pattern.display()} "
-                             f"({ch.pattern.kind}) → "
-                             f"{net}  {DM}{region}{R}")
+                lines.append(f"  Transport : {CY}multicast UDP{R}  "
+                             f"239.73.0.0/16")
+
+            # ── audio ────────────────────────────────────────────────────────
+            lines.append("")
+            if not AUDIO_AVAILABLE:
+                lines.append(f"  Audio     : {RD}unavailable{R}  "
+                             f"{DM}(install pyaudio for PTT){R}")
+            elif not gt.audio.pa:
+                lines.append(f"  Audio     : {YL}pyaudio loaded but device init failed{R}")
+            else:
+                lines.append(f"  Audio     : {GR}available{R}")
+                lines.append(f"  Sample rate : {AUDIO_RATE} Hz  "
+                             f"({AUDIO_RATE // 1000} kHz)")
+                lines.append(f"  Frame size  : {AUDIO_CHUNK} samples  "
+                             f"({1000 * AUDIO_CHUNK // AUDIO_RATE} ms)")
+                lines.append(f"  Channels    : {AUDIO_CHANNELS}  (mono)")
+                lines.append(f"  Bit depth   : 16-bit int  (PCM s16le)")
+
+            # ── codec ────────────────────────────────────────────────────────
+            lines.append("")
+            if OPUS_AVAILABLE and gt.audio.pa and gt.audio._opus_enc:
+                lines.append(f"  Codec     : {GR}Opus{R}  "
+                             f"{OPUS_BITRATE // 1000} kbit/s  "
+                             f"~{OPUS_BITRATE * AUDIO_CHUNK // AUDIO_RATE // 8} B/frame")
+                lines.append(f"  TX format : Opus-encoded  "
+                             f"{DM}(~24× smaller than raw PCM){R}")
+                lines.append(f"  RX compat : {GR}Opus{R} + {GR}PCM{R}  "
+                             f"{DM}(legacy peers decoded automatically){R}")
+            elif OPUS_AVAILABLE:
+                lines.append(f"  Codec     : {YL}PCM{R}  "
+                             f"{DM}(opuslib present but audio device unavailable){R}")
+            else:
+                bitrate = AUDIO_RATE * AUDIO_CHUNK * 16 // AUDIO_CHUNK
+                lines.append(f"  Codec     : {YL}PCM (raw){R}  "
+                             f"{bitrate // 1000} kbit/s  "
+                             f"{AUDIO_CHUNK * 2} B/frame")
+                lines.append(f"  TX format : raw int16 LE")
+                lines.append(f"  Upgrade   : {DM}pip install opuslib  "
+                             f"→ Opus at 32 kbit/s (~24× reduction){R}")
+
+            # ── mute / ptt state ─────────────────────────────────────────────
+            if AUDIO_AVAILABLE and gt.audio.pa:
+                lines.append("")
+                ptt_state  = f"{MG}ACTIVE{R}" if gt._ptt_held else f"{DM}off{R}"
+                mute_state = f"{YL}MUTED{R}" if gt.audio.is_muted else f"{DM}off{R}"
+                lines.append(f"  PTT state : {ptt_state}   "
+                             f"Mute state : {mute_state}")
+
+            # ── channels ─────────────────────────────────────────────────────
+            if gt.channels:
+                lines.append("")
+                for k, ch in gt.channels.items():
+                    region = _lookup_region(ch.pattern.source) \
+                             if ch.pattern.kind == "exact" \
+                             else ch.pattern.region_info().split(";")[0]
+                    if gt.relay_mode:
+                        net = f"relay={gt.relay.relay_addr_str()}"
+                    else:
+                        net = f"mcast={ch.multicast}:{ch.port}"
+                    active_marker = f" {GR}[active]{R}" if k == gt.active else ""
+                    lines.append(f"  #{ch.pattern.display():<18}"
+                                 f" ({ch.pattern.kind}){active_marker}"
+                                 f" → {net}  {DM}{region}{R}")
+
             return "\n".join(lines)
 
         if cmd0 == "relay":

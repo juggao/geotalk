@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.4.0
+geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.6.0
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Bridges GeoTalk UDP traffic across subnets and the internet.
 Clients subscribe to postal-code channels via PKT_JOIN; the relay
 fans out all traffic to every subscriber of that channel.
 
+The relay is codec-transparent: AUDIO packets carry a "codec" field in
+their JSON header ("opus" or "pcm") which is forwarded untouched.
+Clients negotiate codec capability independently; the relay never
+decodes or re-encodes audio payloads.
+
 Supported packet types
   0x01  TEXT       fan-out to channel subscribers
-  0x02  AUDIO      fan-out to channel subscribers
+  0x02  AUDIO      fan-out to channel subscribers  (Opus or PCM, transparent)
   0x03  ACK        client-to-client only — dropped by relay
   0x04  PING       fan-out to channel subscribers  (keeps subscription alive)
   0x06  SCAN_REQ   fan-out to channel subscribers  (probe for active users)
@@ -58,9 +63,9 @@ from collections import defaultdict
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "1.4.0"
+VERSION  = "1.6.0"
 MAGIC    = b"GT"
-BUF_SIZE = 8192
+BUF_SIZE = 65536   # large enough for any codec frame (Opus ~80 B, PCM ~4 KB)
 
 # Packet type bytes
 PKT_TEXT     = 0x01
@@ -313,6 +318,7 @@ class ClientRegistry:
             f"  Channels : {CY}{n_ch}{R}",
             f"  RX total : {self.total_pkts_rx} pkts  {_fmt_bytes(self.total_bytes_rx)}",
             f"  TX total : {self.total_pkts_tx} pkts  {_fmt_bytes(self.total_bytes_tx)}",
+            f"  Codec    : {DM}transparent (Opus/PCM forwarded as-is){R}",
         ])
 
     def channels_detail(self) -> str:

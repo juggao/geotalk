@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.5.0**
+**Version 1.6.0**
 
 ---
 
@@ -20,7 +20,7 @@ via a relay server.
 | 🧩 | Regex channels | `/^[0-9]{4}[A-Z]{2}$/` — full Python regex between `//` |
 | 🗺️ | Region database | 120+ EU postal prefixes resolved to human-readable region names |
 | 💬 | Text messaging | Instant broadcast to all channel members |
-| 🎙️ | Push-to-Talk (PTT) | Real mic audio over UDP (16 kHz PCM) |
+| 🎙️ | Push-to-Talk (PTT) | Real mic audio over UDP — **Opus codec** (32 kbit/s) when `opuslib` installed, raw PCM fallback |
 | 📻 | Multi-channel RX | Subscribe to many channels at once; all arrive in one terminal |
 | 🔎 | Channel scan | `/scan 59**` — probe a region for live users, results stream in real time |
 | 🌐 | Relay mode | `--relay HOST` for internet use — no multicast routing needed |
@@ -54,6 +54,11 @@ pip3 install pyaudio --break-system-packages
 
 # On Debian / Ubuntu you may also need:
 sudo apt install portaudio19-dev python3-pyaudio
+
+# For Opus codec (recommended — ~24x bandwidth reduction over raw PCM):
+pip3 install opuslib --break-system-packages
+# Opus is optional — GeoTalk falls back to raw PCM if not installed.
+# Both modes interoperate: Opus and PCM clients can share the same channel.
 ```
 
 ---
@@ -201,7 +206,7 @@ Full Python regex syntax enclosed in `/` `/`.
 ```
 
 Responses stream live as peers reply. A summary table is printed at the end.
-Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+).
+Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+).
 
 ### Channel management
 ```
@@ -244,7 +249,14 @@ lines are suppressed in the REPL but text and ping messages still appear.
 When multiple peers transmit simultaneously, their audio streams are mixed
 in real time before playback — each sender has an independent ring buffer,
 and a mixer thread combines them sample-by-sample with saturation clipping
-every 64 ms. You hear a clean blend rather than interleaved fragments.
+every 20 ms (one Opus frame at 48 kHz / 960 samples). You hear a clean
+blend rather than interleaved fragments.
+
+With `opuslib` installed, transmitted audio is Opus-encoded at 32 kbit/s
+(~80 bytes per 20 ms frame) before sending and decoded on receipt — roughly
+a 24× reduction vs raw PCM. Without `opuslib`, raw int16 PCM is used
+automatically; the `codec` field in each packet's JSON header lets Opus
+and PCM clients coexist on the same channel.
 
 ### Info & status
 ```
@@ -373,7 +385,8 @@ Scan sessions expire after 60 seconds.
 │ Magic   │ Type   │ Payload len │ JSON payload         │
 │ "GT" 2B │ 1B     │ uint16 BE   │ variable             │
 └─────────┴────────┴─────────────┴──────────────────────┘
-AUDIO packets append raw PCM after the JSON header.
+AUDIO packets append the audio payload after the JSON header.
+The JSON "codec" field specifies encoding: "opus" (compressed) or "pcm" (raw int16 LE).
 ```
 
 ### Packet types
@@ -381,7 +394,7 @@ AUDIO packets append raw PCM after the JSON header.
 | Type | Hex | JSON fields | Description |
 |---|---|---|---|
 | TEXT | 0x01 | `n` nick · `p` channel · `t` text · `id` · `ts` | Text message |
-| AUDIO | 0x02 | `n` · `p` · `s` seq · _+ PCM bytes_ | Voice chunk |
+| AUDIO | 0x02 | `n` · `p` · `s` seq · `codec` ("opus"/"pcm") · _+ audio bytes_ | Voice chunk |
 | ACK | 0x03 | `n` · `p` · `ts` | Client-to-client acknowledgement (not relayed) |
 | PING | 0x04 | `n` · `p` · `ts` | Presence heartbeat (60 s interval) |
 | SCAN_REQ | 0x06 | `n` · `p` channel · `sid` scan-id · `ts` | Scan probe |
@@ -446,7 +459,7 @@ sudo ufw allow 5073:5326/udp
 
 | Idea | Notes |
 |---|---|
-| OPUS codec | `pip install opuslib` — drop-in for raw PCM, ~10× bandwidth reduction |
+| ~~OPUS codec~~ | ✅ Built-in since v1.6.0 — `pip install opuslib` to enable |
 | AES-256 encryption | Per-channel key derivable from postal code + shared passphrase |
 | Web UI | Flask + WebSocket bridge to the relay's UDP socket |
 | D-STAR / DMR gateway | Link to licensed repeaters via `dvswitch` or `MMDVM` |
