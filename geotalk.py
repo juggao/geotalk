@@ -47,7 +47,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "1.6.0"
+VERSION      = "1.8.2"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -68,6 +68,10 @@ PKT_SCAN_RSP = 0x07   # scan: "yes, I am — here is my info"
 # Relay control (mirrors geotalk-relay.py)
 PKT_JOIN     = 0x10
 PKT_LEAVE    = 0x11
+# BBS (relay mode only)
+PKT_BBS_POST = 0x12   # client → relay: store a BBS message
+PKT_BBS_REQ  = 0x13   # client → relay: request BBS messages for a channel
+PKT_BBS_RSP  = 0x14   # relay → client: deliver BBS messages (JSON array)
 
 # ANSI colours
 R  = "\033[0m"
@@ -88,6 +92,12 @@ DM = "\033[2m"
 # Each entry: (glob_pattern, country_code, region_label)
 # Patterns use * as wildcard for any character(s).
 # More-specific patterns must come BEFORE less-specific ones.
+
+# All country codes present in the DB — used by /country validation
+KNOWN_COUNTRIES: set[str] = {
+    "NL", "DE", "FR", "BE", "LU", "GB", "ES", "IT", "PT",
+    "CH", "AT", "PL", "CZ", "DK", "SE", "NO", "FI",
+}
 
 _GEO_REGIONS: list[tuple[str, str, str]] = [
     # ── Netherlands ──────────────────────────────────────────────────────────
@@ -113,16 +123,16 @@ _GEO_REGIONS: list[tuple[str, str, str]] = [
     ("56**??", "NL", "Eindhoven"),
     ("57**??", "NL", "Eindhoven"),
     ("58**??", "NL", "Eindhoven / Weert"),
-    ("590???", "NL", "Venlo Noord"),
-    ("591???", "NL", "Venlo Centrum"),
-    ("592???", "NL", "Venlo Zuid"),
-    ("593???", "NL", "Venlo / Blerick"),
-    ("594???", "NL", "Tegelen"),
-    ("595???", "NL", "Arcen / Bergen (L)"),
-    ("596???", "NL", "Venlo / Horst"),
-    ("597???", "NL", "Horst aan de Maas"),
-    ("598???", "NL", "Venray"),
-    ("599???", "NL", "Bergen / Gennep"),
+    ("590*??", "NL", "Venlo Noord"),
+    ("591*??", "NL", "Venlo Centrum"),
+    ("592*??", "NL", "Venlo Zuid"),
+    ("593*??", "NL", "Venlo / Blerick"),
+    ("594*??", "NL", "Tegelen"),
+    ("595*??", "NL", "Arcen / Bergen (L)"),
+    ("596*??", "NL", "Venlo / Horst"),
+    ("597*??", "NL", "Horst aan de Maas"),
+    ("598*??", "NL", "Venray"),
+    ("599*??", "NL", "Bergen / Gennep"),
     ("59****", "NL", "Venlo regio"),          # catch-all for #59**
     ("60**??", "NL", "Weert"),
     ("61**??", "NL", "Roermond"),
@@ -356,28 +366,54 @@ def _get_compiled() -> list[tuple[re.Pattern, str, str]]:
 def _glob_to_regex(pattern: str) -> str:
     """
     Convert a GeoTalk glob pattern to a Python regex.
-    Rules:
-      *  → matches any single non-space character (one char wildcard)
-      ** → matches one or more non-space characters (multi-char wildcard)
-    We do a two-pass replace to avoid double-escaping.
+
+    Wildcard semantics
+    ──────────────────
+      *   → exactly one digit          [0-9]
+      **  → one or more any non-space  [^\\s]+   (general multi-char wildcard)
+      *** → exactly three digits       [0-9]{3}
+      **** or more → one-or-more any   [^\\s]+   (catch-all)
+      ?   → exactly one letter         [A-Za-z]
+
+    Runs of * are counted before dispatching so that `***` is not
+    mis-parsed as `**` + `*`.
+
+    Examples
+    ────────
+      NL  3***??   →  3 + [0-9]{3} + [A-Za-z]{2}   matches 3402AB
+      NL  590*??   →  590 + [0-9] + [A-Za-z]{2}    matches 5901AB
+      NL  40**??   →  40 + [0-9]+ + [A-Za-z]{2}    matches 4012AB
+      DE  40***    →  40 + [0-9]{3}                 matches 40115
+      FR  750**    →  750 + [0-9]+                  matches 75001
+      GB  G**      →  G + [^\\s]+                    matches G1, G12
+      NL  59****   →  59 + [^\\s]+                   catch-all
     """
-    # Escape all regex-special chars except *
     escaped = ""
     i = 0
     while i < len(pattern):
         ch = pattern[i]
         if ch == "*":
-            if i + 1 < len(pattern) and pattern[i+1] == "*":
-                escaped += "__MULTI__"
-                i += 2
+            # Count the full run of consecutive *
+            j = i
+            while j < len(pattern) and pattern[j] == "*":
+                j += 1
+            run = j - i
+            i = j
+            if run == 1:
+                escaped += "[0-9]"
+            elif run == 2:
+                escaped += "[^\\s]+"
+            elif run == 3:
+                escaped += "[0-9]{3}"
             else:
-                escaped += "__SINGLE__"
-                i += 1
+                # 4+ stars: general catch-all
+                escaped += "[^\\s]+"
+        elif ch == "?":
+            escaped += "[A-Za-z]"
+            i += 1
         else:
             escaped += re.escape(ch)
             i += 1
-    escaped = escaped.replace("__MULTI__", "[^\\s]+")
-    escaped = escaped.replace("__SINGLE__", "[^\\s]")
     return f"^{escaped}$"
 
 
@@ -436,31 +472,44 @@ class ChannelPattern:
             return f"/{self.source}/"
         return self.source
 
-    def region_info(self) -> str:
-        """Return human-readable region name(s) matching this pattern."""
+    def region_info(self, cc: str = "") -> str:
+        """Return human-readable region name(s) matching this pattern.
+        If cc is given, prefer matches for that country."""
         if self.kind == "exact":
-            return _lookup_region(self.source)
+            return _lookup_region(self.source, cc)
         # For wildcards, list all DB entries that overlap
         hits = []
-        for pat, cc, label in _GEO_REGIONS:
-            # Does the DB pattern match what this wildcard could produce?
-            # Heuristic: check if the pattern text overlaps
+        for pat, country, label in _GEO_REGIONS:
             if _patterns_overlap(self.source, pat):
-                hits.append(f"{cc} · {label}")
-        if hits:
-            return "; ".join(dict.fromkeys(hits))   # deduplicate, keep order
-        return "unknown region"
+                hits.append((country, f"{country} · {label}"))
+        if not hits:
+            return "unknown region"
+        # If we have a country preference, filter to it first
+        if cc:
+            cc_hits = [h for h in hits if h[0] == cc]
+            if cc_hits:
+                return "; ".join(dict.fromkeys(h[1] for h in cc_hits))
+        return "; ".join(dict.fromkeys(h[1] for h in hits))
 
     def __repr__(self):
         return f"ChannelPattern({self.kind}, {self.source!r})"
 
 
-def _lookup_region(postal: str) -> str:
-    """Find the best-matching region label for an exact postal code."""
+def _lookup_region(postal: str, cc: str = "") -> str:
+    """Find the best-matching region label for an exact postal code.
+    If cc is given, only return matches for that country — no cross-country
+    fallback, so a Dutch user never sees Luxembourg for an unrecognised code."""
     postal_norm = postal.strip().upper().replace(" ", "")
-    for compiled_re, cc, label in _get_compiled():
+    for compiled_re, country, label in _get_compiled():
+        if cc and country != cc:
+            continue
         if compiled_re.match(postal_norm):
-            return f"{cc} · {label}"
+            return f"{country} · {label}"
+    # No cc filter: return first match from any country
+    if not cc:
+        for compiled_re, country, label in _get_compiled():
+            if compiled_re.match(postal_norm):
+                return f"{country} · {label}"
     return "unknown region"
 
 
@@ -531,30 +580,36 @@ def parse_channel(raw: str) -> ChannelPattern:
     return ChannelPattern(raw)
 
 
-def expand_wildcard_info(pattern: ChannelPattern) -> str:
+def expand_wildcard_info(pattern: ChannelPattern, cc: str = "") -> str:
     """
     For a wildcard/regex channel, return a formatted table of
     known sub-regions that fall within the pattern.
+    If cc is given, prefer entries for that country (show others dimmed).
     """
     if not pattern.is_wildcard():
-        region = _lookup_region(pattern.key)
+        region = _lookup_region(pattern.key, cc)
         return f"  Region: {region}"
 
-    lines   = []
+    lines_primary   = []
+    lines_secondary = []
     seen    = set()
     user_re = pattern._re
 
-    for db_pat, cc, label in _GEO_REGIONS:
+    for db_pat, country, label in _GEO_REGIONS:
         # Generate a sample postal code from the DB pattern (replace * with 0)
         sample = db_pat.replace("*", "0").replace("?", "0")
-        if user_re.match(sample) and (cc, label) not in seen:
-            seen.add((cc, label))
-            lines.append(f"    {CY}{cc}{R}  {label}")
-        # Also test: does the DB pattern overlap with user pattern?
-        elif _patterns_overlap(pattern.source, db_pat) and (cc, label) not in seen:
-            seen.add((cc, label))
-            lines.append(f"    {CY}{cc}{R}  {label}  {DM}(approx.){R}")
+        matched = (user_re.match(sample) or
+                   _patterns_overlap(pattern.source, db_pat))
+        if matched and (country, label) not in seen:
+            seen.add((country, label))
+            is_primary = (not cc) or (country == cc)
+            entry = f"    {CY}{country}{R}  {label}"
+            if is_primary:
+                lines_primary.append(entry)
+            else:
+                lines_secondary.append(f"    {DM}{country}  {label}  (other country){R}")
 
+    lines = lines_primary + lines_secondary
     if lines:
         return "\n".join([f"  Sub-regions covered by {YL}#{pattern.display()}{R}:"]
                          + lines[:20])   # cap at 20
@@ -620,6 +675,18 @@ def encode_scan_rsp(nick: str, postal: str, scan_id: str,
                           "ts": int(time.time())}).encode()
     return MAGIC + bytes([PKT_SCAN_RSP]) + struct.pack("!H", len(payload)) + payload
 
+def encode_bbs_post(nick: str, postal: str, text: str) -> bytes:
+    """Client → relay: store one BBS message."""
+    payload = json.dumps({"n": nick, "p": postal, "t": text,
+                          "ts": int(time.time())}).encode()
+    return MAGIC + bytes([PKT_BBS_POST]) + struct.pack("!H", len(payload)) + payload
+
+def encode_bbs_req(nick: str, postal: str) -> bytes:
+    """Client → relay: request all stored BBS messages for a channel."""
+    payload = json.dumps({"n": nick, "p": postal,
+                          "ts": int(time.time())}).encode()
+    return MAGIC + bytes([PKT_BBS_REQ]) + struct.pack("!H", len(payload)) + payload
+
 def decode_packet(data: bytes) -> dict | None:
     if len(data) < 5 or data[:2] != MAGIC:
         return None
@@ -658,6 +725,12 @@ def decode_packet(data: bytes) -> dict | None:
     if ptype == PKT_SCAN_RSP:
         try:
             return {"type": "scan_rsp", **json.loads(body[:plen])}
+        except Exception:
+            return None
+
+    if ptype == PKT_BBS_RSP:
+        try:
+            return {"type": "bbs_rsp", **json.loads(body[:plen])}
         except Exception:
             return None
 
@@ -1222,11 +1295,11 @@ class Channel:
         now = time.time()
         return [n for n, t in self.users.items() if now - t < ttl]
 
-    def summary(self) -> str:
+    def summary(self, cc: str = "") -> str:
         users  = self.active_users()
         up     = int(time.time() - self.joined_at)
-        region = _lookup_region(self.pattern.source) if self.pattern.kind == "exact" \
-                 else self.pattern.region_info()
+        region = _lookup_region(self.pattern.source, cc) if self.pattern.kind == "exact" \
+                 else self.pattern.region_info(cc)
         return (f"{B}{CY}#{self.pattern.display()}{R}  "
                 f"{DM}{region}{R}  "
                 f"mcast={self.multicast}:{self.port}  "
@@ -1439,17 +1512,19 @@ class ChannelScanner:
 
     def __init__(self, nick: str, local_if: str = "0.0.0.0",
                  relay: "RelayTransport | None" = None,
-                 on_result=None):
+                 on_result=None, cc: str = ""):
         """
         nick      – our callsign (used in outgoing SCAN_REQ)
         local_if  – local interface IP for multicast (mirrors MulticastSocket)
         relay     – if set, send probes via relay instead of multicast
         on_result – callable(ScanResult) called live as replies arrive
+        cc        – country code for region label filtering
         """
         self.nick      = nick
         self.local_if  = local_if
         self.relay     = relay
         self.on_result = on_result
+        self.cc        = cc
         self.scan_id   = _uuid.uuid4().hex[:8]
         self._results  : dict[str, list[ScanResult]] = defaultdict(list)
         self._lock     = threading.Lock()
@@ -1610,7 +1685,19 @@ class ChannelScanner:
         channel_key = pkt.get("p", "")
         users       = pkt.get("u", [])
         msg_count   = pkt.get("mc", 0)
-        region      = _lookup_region(channel_key)
+
+        # channel_key may carry a GLOB:/REGEX: prefix (wildcard join).
+        # _lookup_region only understands plain postal strings, so strip the
+        # prefix and use region_info() for pattern keys.
+        if channel_key.startswith(("GLOB:", "REGEX:")):
+            try:
+                region = parse_channel(
+                    channel_key[channel_key.index(":")+1:]
+                ).region_info(self.cc)
+            except Exception:
+                region = "unknown region"
+        else:
+            region = _lookup_region(channel_key, self.cc)
 
         dedup_key = f"{channel_key}:{nick}"
         if dedup_key in seen:
@@ -1640,8 +1727,10 @@ class GeoTalk:
         self.debug       = debug
         self.relay_host  = relay_host
         self.relay_port  = relay_port
-        self.channels    = {}     # key → Channel
-        self.active      = None   # current TX channel key
+        self.channels             = {}    # key → Channel
+        self.active               = None  # current TX channel key
+        self._channel_history : list[str] = []  # ordered list of previously active keys
+        self._current_country     = "NL"  # country context for region display
         self.mcast       = MulticastSocket(port, local_if=local_if,
                                            debug=debug)
         self._glob_socks : dict[str, list[str]] = {}  # wildcard key → [exact keys]
@@ -1724,6 +1813,7 @@ class GeoTalk:
         self.channels[key] = ch
         if self.active is None:
             self.active = key
+            self._channel_history.append(key)
 
         if self.relay_mode:
             # Relay path: subscribe the glob key AND all enumerated concrete
@@ -1738,6 +1828,8 @@ class GeoTalk:
                         sub_keys.append(code)
                 self._glob_socks[key] = sub_keys
             self.relay.send(encode_ping(self.nick, key))
+            # Auto-fetch BBS messages for this channel
+            self.relay.send(encode_bbs_req(self.nick, key))
         else:
             # Multicast path: join the pattern's own group AND, for wildcards,
             # all enumerated concrete groups so packets from exact-channel peers
@@ -1745,7 +1837,7 @@ class GeoTalk:
             self._join_mcast_groups(key, pat)
             self.mcast.send(key, encode_ping(self.nick, key))
 
-        region_line = expand_wildcard_info(pat)
+        region_line = expand_wildcard_info(pat, self._current_country)
         n_extra     = len(self._glob_socks.get(key, []))
         extra       = f" + {n_extra} sub-channels" if n_extra else ""
         if self.relay_mode:
@@ -1755,7 +1847,13 @@ class GeoTalk:
         return (f"{GR}Joined #{pat.display()}{R}  "
                 f"→ {transport}\n{region_line}")
 
-    def leave_channel(self, raw: str) -> str:
+    def leave_channel(self, raw: str = "") -> str:
+        # With no argument, leave the currently active channel
+        if not raw:
+            if not self.active:
+                return f"{YL}No active channel to leave.{R}"
+            raw = self.active
+
         try:
             pat = parse_channel(raw)
         except ValueError as e:
@@ -1769,6 +1867,7 @@ class GeoTalk:
             else:
                 return f"{YL}Not on #{pat.display()}{R}"
 
+        was_active = (self.active == key)
         del self.channels[key]
 
         if self.relay_mode:
@@ -1778,9 +1877,29 @@ class GeoTalk:
         else:
             self._leave_mcast_groups(key)
 
-        if self.active == key:
-            self.active = next(iter(self.channels), None)
-        return f"{RD}Left #{pat.display()}{R}"
+        # Remove this key from history wherever it appears
+        self._channel_history = [k for k in self._channel_history if k != key]
+
+        if was_active:
+            # Walk history backwards to find the most recent channel still joined
+            prev = None
+            while self._channel_history:
+                candidate = self._channel_history.pop()
+                if candidate in self.channels:
+                    prev = candidate
+                    break
+            self.active = prev
+
+        ch_display = pat.display()
+        result = f"{RD}Left #{ch_display}{R}"
+        if was_active and self.active:
+            prev_pat = self.channels[self.active].pattern
+            cc = self._current_country
+            result += (f"\n{CY}Active → #{prev_pat.display()}{R}  "
+                      f"{DM}{_lookup_region(self.active, cc) if prev_pat.kind == 'exact' else prev_pat.region_info(cc)}{R}")
+        elif was_active:
+            result += f"\n{YL}No more channels — join one with #POSTCODE{R}"
+        return result
 
     def switch_channel(self, raw: str) -> str:
         try:
@@ -1791,11 +1910,17 @@ class GeoTalk:
         key = pat.key
         if key not in self.channels:
             result = self.join_channel(raw)
-            self.active = key
+            if self.active != key:
+                if self.active:
+                    self._channel_history.append(self.active)
+                self.active = key
             return result
-        self.active = key
-        region = _lookup_region(pat.source) if pat.kind == "exact" \
-                 else pat.region_info()
+        if self.active != key:
+            if self.active:
+                self._channel_history.append(self.active)
+            self.active = key
+        region = _lookup_region(pat.source, self._current_country) if pat.kind == "exact" \
+                 else pat.region_info(self._current_country)
         return (f"{CY}Active → #{pat.display()}{R}  "
                 f"{DM}{region}{R}")
 
@@ -1938,7 +2063,8 @@ class GeoTalk:
 
         candidates = _expand_scan_candidates(pat)
         n_cand     = len(candidates)
-        region_hint = pat.region_info() if pat.is_wildcard() else _lookup_region(pat.source)
+        cc         = self._current_country
+        region_hint = pat.region_info(cc) if pat.is_wildcard() else _lookup_region(pat.source, cc)
 
         # Print header immediately so the user sees feedback
         sys.stdout.write(
@@ -1968,6 +2094,7 @@ class GeoTalk:
             local_if=self.mcast.local_if,
             relay=relay,
             on_result=on_result,
+            cc=cc,
         )
 
         results = scanner.run(candidates, timeout=timeout)
@@ -2048,6 +2175,11 @@ class GeoTalk:
 
         # ── scan_rsp packets are handled by ChannelScanner, not here ──────
         if pkt_type == "scan_rsp":
+            return
+
+        # ── BBS response: relay → client, display and return ───────────────
+        if pkt_type == "bbs_rsp":
+            self._render_bbs_rsp(pkt)
             return
 
         if nick == self.nick:
@@ -2174,7 +2306,7 @@ class GeoTalk:
                        pat: "ChannelPattern"):
         """Print an inbound packet to the terminal."""
         ts     = datetime.now().strftime("%H:%M")
-        region = _lookup_region(sender_postal)
+        region = _lookup_region(sender_postal, self._current_country)
 
         if pkt["type"] == "text":
             sys.stdout.write(
@@ -2200,6 +2332,31 @@ class GeoTalk:
                 f"\r{DM}{ts}{R} {DM}→ {nick} online "
                 f"({region}) #{pat.display()}{R}\n")
 
+        sys.stdout.flush()
+        self._redraw_prompt()
+
+    def _render_bbs_rsp(self, pkt: dict):
+        """Render BBS messages received from the relay after joining a channel."""
+        channel  = pkt.get("p", "?")
+        messages = pkt.get("msgs", [])
+        if not messages:
+            return
+        region = _lookup_region(channel, self._current_country)
+        sys.stdout.write(
+            f"\r{DM}{'─' * 60}{R}\n"
+            f"\r{B}{CY}  📋 BBS #{channel}{R}  {DM}{region} — "
+            f"{len(messages)} stored message{'s' if len(messages) != 1 else ''}{R}\n")
+        for msg in messages:
+            ts_raw = msg.get("ts", 0)
+            try:
+                ts_str = datetime.fromtimestamp(ts_raw).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                ts_str = "?"
+            nick = msg.get("n", "?")
+            text = msg.get("t", "")
+            sys.stdout.write(
+                f"\r  {DM}{ts_str}{R}  {B}{CY}[{nick}]{R}  {text}\n")
+        sys.stdout.write(f"\r{DM}{'─' * 60}{R}\n")
         sys.stdout.flush()
         self._redraw_prompt()
 
@@ -2270,7 +2427,8 @@ HELP_TEXT = f"""
   {YL}#75***{R}             Wildcard — Paris region
   {YL}#/^59[0-9]{{3}}$/{R}  Regex channel (Python regex between //)
   {YL}/join 59**{R}         Join wildcard channel (stays in background)
-  {YL}/leave 59**{R}        Leave a channel
+  {YL}/leave{R}             Leave the active channel (auto-switches to previous)
+  {YL}/leave 59**{R}        Leave a specific channel
   {YL}/ch{R}                List joined channels with region info
   {YL}/sw 59**{R}           Switch active TX channel
 
@@ -2278,11 +2436,19 @@ HELP_TEXT = f"""
   {YL}<text>{R}             Send text to active channel
   {YL}/msg 59** hi!{R}      Send to specific channel
 
+{B}BBS — Bulletin Board (relay mode only){R}
+  {YL}/bbs Hello world{R}   Post a message to the BBS of the active channel
+  {YL}/bbs{R}               Fetch and display stored BBS messages
+  Messages are stored on the relay server and delivered automatically on join.
+
 {B}Region lookup{R}
   {YL}/lookup 59**{R}       Show all known sub-regions for a pattern
   {YL}/lookup 5911AB{R}     Look up exact postal code region
   {YL}/postal Venlo{R}      Reverse lookup: find postal patterns by city or region name
   {YL}/postal Amsterdam{R}  Works for any EU city in the region database
+  {YL}/country{R}           Show current country setting (default: NL)
+  {YL}/country DE{R}        Set country to DE — region labels filtered to Germany
+  Supported: NL DE FR BE LU GB ES IT PT CH AT PL CZ DK SE NO FI
 
 {B}Voice / PTT{R}
   {YL}/ptt on{R}            Push-to-talk ON  (mic → multicast)
@@ -2362,7 +2528,7 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             lines = [f"{B}Lookup: #{pat.display()}{R}  "
                      f"({pat.kind})  "
                      f"mcast={postal_to_multicast(pat.key)}:{postal_to_port(pat.key)}"]
-            lines.append(expand_wildcard_info(pat))
+            lines.append(expand_wildcard_info(pat, gt._current_country))
             return "\n".join(lines)
 
         if cmd0 == "postal":
@@ -2406,8 +2572,46 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             lines.append(f"\n{DM}Tip: use #{suggestion} to join, or /scan {suggestion} to find active users{R}")
             return "\n".join(lines)
 
+        if cmd0 == "country":
+            known = sorted(KNOWN_COUNTRIES)
+            if len(parts) < 2:
+                return (f"Country: {CY}{gt._current_country}{R}  "
+                        f"{DM}Region lookups are filtered to this country.{R}\n"
+                        f"  Known: {', '.join(known)}\n"
+                        f"  Usage: {YL}/country DE{R}  or  {YL}/country FR{R}")
+            code = parts[1].strip().upper()
+            if code not in KNOWN_COUNTRIES:
+                return (f"{YL}Unknown country code '{code}'.{R}  "
+                        f"Known: {', '.join(known)}\n"
+                        f"  Use /country without argument to show current setting.")
+            gt._current_country = code
+            return (f"{GR}Country set to {CY}{code}{R}  "
+                    f"{DM}Region lookups now filtered to {code}.{R}")
+
         if cmd0 == "help":
             return HELP_TEXT
+
+        if cmd0 == "bbs":
+            if not gt.relay_mode:
+                return (f"{YL}BBS is only available in relay mode.{R}\n"
+                        f"  Start with {YL}--relay HOST{R} to use BBS.")
+            if not gt.active:
+                return f"{YL}Join a channel first.{R}"
+            text = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+            if text:
+                # Post a BBS message
+                pkt = encode_bbs_post(gt.nick, gt.active, text)
+                gt.relay.send(pkt)
+                ch_display = gt.channels[gt.active].pattern.display() \
+                             if gt.active in gt.channels else gt.active
+                return (f"{GR}BBS posted to #{ch_display}{R}  "
+                        f"{DM}({datetime.now().strftime('%Y-%m-%d %H:%M')}){R}\n"
+                        f"  {text}")
+            else:
+                # Fetch BBS messages
+                pkt = encode_bbs_req(gt.nick, gt.active)
+                gt.relay.send(pkt)
+                return f"{DM}Fetching BBS messages for #{gt.active}…{R}"
 
         if cmd0 == "whoami":
             return f"{GR}{gt.nick}{R}"
@@ -2418,7 +2622,7 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             lines = []
             for k, ch in gt.channels.items():
                 marker = f"{GR}►{R} " if k == gt.active else "  "
-                lines.append(marker + ch.summary())
+                lines.append(marker + ch.summary(gt._current_country))
             return "\n".join(lines)
 
         if cmd0 in ("join", "j"):
@@ -2427,9 +2631,10 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             return gt.join_channel(parts[1])
 
         if cmd0 in ("leave", "part"):
-            if len(parts) < 2:
-                return f"{YL}Usage: /leave POSTCODE{R}"
-            return gt.leave_channel(parts[1])
+            # /leave         → leave current active channel
+            # /leave PATTERN → leave specific channel
+            target = parts[1] if len(parts) >= 2 else ""
+            return gt.leave_channel(target)
 
         if cmd0 in ("sw", "switch"):
             if len(parts) < 2:
@@ -2469,6 +2674,8 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             lines.append(f"  Port base : {gt.port}")
             lines.append(f"  Interface : {gt.local_if}  "
                          f"{DM}(0.0.0.0 = OS default){R}")
+            lines.append(f"  Country   : {CY}{gt._current_country}{R}  "
+                         f"{DM}(set with /country CODE){R}")
             if gt.relay_mode:
                 conn = f"{GR}connected{R}" if gt.relay.is_connected() \
                        else f"{RD}disconnected{R}"
@@ -2528,9 +2735,9 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             if gt.channels:
                 lines.append("")
                 for k, ch in gt.channels.items():
-                    region = _lookup_region(ch.pattern.source) \
+                    region = _lookup_region(ch.pattern.source, gt._current_country) \
                              if ch.pattern.kind == "exact" \
-                             else ch.pattern.region_info().split(";")[0]
+                             else ch.pattern.region_info(gt._current_country).split(";")[0]
                     if gt.relay_mode:
                         net = f"relay={gt.relay.relay_addr_str()}"
                     else:
@@ -2751,6 +2958,8 @@ Examples:
         if postal:
             channel = _best_auto_channel(postal)
             city_str = f"{city}, {cc}" if city else cc
+            if cc and cc in KNOWN_COUNTRIES:
+                gt._current_country = cc
             print(f"\r  {GR}Location detected:{R} {postal} ({city_str})  \u2192  auto-joining #{channel}")
             print(gt.join_channel(channel))
         else:

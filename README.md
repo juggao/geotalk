@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.6.0**
+**Version 1.8.2**
 
 ---
 
@@ -29,6 +29,8 @@ via a relay server.
 | 🔊 | Audio mixing | Simultaneous speakers are mixed in real time — no garbled interleaving |
 | 🏙️ | Postal reverse lookup | `/postal Venlo` finds all matching channel patterns by city name |
 | 📍 | Auto-channel | `--auto-channel` detects your location from public IP and joins the nearest channel automatically |
+| 📋 | BBS | `/bbs TEXT` posts a persistent message to the channel bulletin board; messages are auto-delivered on join (relay mode only) |
+| 🌍 | Country context | `/country NL` filters all region labels to one country — no cross-country noise on shared postal prefixes |
 
 ---
 
@@ -206,16 +208,19 @@ Full Python regex syntax enclosed in `/` `/`.
 ```
 
 Responses stream live as peers reply. A summary table is printed at the end.
-Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+).
+Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+; BBS requires relay v1.7.1+; country context requires v1.8.1+).
 
 ### Channel management
 ```
 /join 59**          Join a channel in the background
-/leave 59**         Leave a channel
+/leave              Leave the active channel (auto-switches to previous)
+/leave 59**         Leave a specific channel
 /sw 59**            Switch active TX channel
 /ch                 List all joined channels (region, multicast/relay, stats)
 /msg 59** hello!    Send text to a specific channel
 ```
+
+When leaving the active channel, GeoTalk automatically switches to the most recently visited channel that is still joined. The terminal shows the new active channel and its region. If no other channels are joined, a prompt to join one is shown instead.
 
 ### Region lookup
 ```
@@ -232,6 +237,23 @@ Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channe
 ```
 
 Results are grouped by country, show the DB pattern and a ready-to-use glob, and end with a tip for joining or scanning. Works for any city or region name in the 120+ entry database.
+
+### Country context
+
+Many postal code prefixes are shared across countries — `#10***` is Berlin in Germany *and* Brussels in Belgium, `#59**` covers both Venlo (NL) and Lille (FR). The country context setting controls which country's region labels are shown in all output.
+
+```
+/country            Show current country setting and all supported codes
+/country NL         Filter region labels to Netherlands (default)
+/country DE         Filter region labels to Germany
+/country FR         Filter region labels to France
+```
+
+When a match exists for the active country it is shown normally. When no match exists for that country (e.g. looking up a Dutch postcode while country is set to DE), GeoTalk falls back to the best match from any country so you never see a blank region.
+
+`--auto-channel` sets the country automatically from the detected IP geolocation.
+
+Supported country codes: `NL` `DE` `FR` `BE` `LU` `GB` `ES` `IT` `PT` `CH` `AT` `PL` `CZ` `DK` `SE` `NO` `FI`
 
 ### Voice / PTT
 ```
@@ -258,10 +280,30 @@ a 24× reduction vs raw PCM. Without `opuslib`, raw int16 PCM is used
 automatically; the `codec` field in each packet's JSON header lets Opus
 and PCM clients coexist on the same channel.
 
+### BBS — Bulletin Board (relay mode only)
+
+```
+/bbs Hello world    Post a message to the active channel's BBS on the relay
+/bbs                Fetch and display all stored BBS messages for the channel
+```
+
+BBS messages are stored persistently on the relay server per channel. When you join a channel in relay mode, stored messages are delivered automatically and displayed as a framed table:
+
+```
+────────────────────────────────────────────────────────────
+  📋 BBS #5912  Venlo Centrum — 3 stored messages
+  2026-03-08 14:22  [PA3XYZ]  Relay test from Tegelen
+  2026-03-08 15:01  [DL2ABC]  Anyone active tonight?
+  2026-03-08 15:44  [F4BCD]   Good signal here in Paris
+────────────────────────────────────────────────────────────
+```
+
+BBS is not available in LAN multicast mode — use `--relay HOST` to enable it.
+
 ### Info & status
 ```
 /users      Active users on current channel (last 5 min)
-/info       Transport mode, addresses, all joined channels
+/info       Transport mode, audio settings, codec, all joined channels
 /relay      Relay connection status (relay mode only)
 /whoami     Your callsign
 /help       Full in-app help
@@ -328,6 +370,8 @@ python3 geotalk-relay.py \
   --port 5073 \
   --ttl 600 \
   --max-per-channel 64 \
+  --bbs-file /var/lib/geotalk/bbs.json \
+  --bbs-max 100 \
   --log-file /var/log/geotalk-relay.log \
   --quiet
 ```
@@ -342,6 +386,8 @@ python3 geotalk-relay.py \
 | `--max-per-channel` | `128` | Max clients per channel (anti-flood) |
 | `--log-file` | _(none)_ | Append structured log lines to a file |
 | `--quiet` | off | Suppress per-packet console output |
+| `--bbs-file` | `geotalk-bbs.json` | JSON file for BBS persistence (use `''` to disable) |
+| `--bbs-max` | `50` | Max BBS messages stored per channel |
 
 ### Relay console commands
 
@@ -352,6 +398,9 @@ Type these while the relay is running:
 | `stats` | Summary: uptime, client count, channel count, RX/TX bytes |
 | `channels` | Per-channel listing with subscriber nicks |
 | `clients` | Per-client table: nick, IP, channels, uptime, idle, packet counts |
+| `bbs` | List all BBS channels and message counts |
+| `bbs CHANNEL` | Show all stored messages for a specific channel |
+| `bbs-clear CHANNEL` | Delete all BBS messages for a channel |
 | `kick NICK` | Evict a client by callsign |
 | `ban IP` | Block an IP address (until restart or `unban`) |
 | `unban IP` | Remove an IP ban |
@@ -370,6 +419,9 @@ Type these while the relay is running:
 | `ACK` (0x03) | Client-to-client only — dropped by relay |
 | `SCAN_REQ` (0x06) | Fan-out to channel + record `scan_id → requester addr` |
 | `SCAN_RSP` (0x07) | **Unicast back to original requester only** |
+| `BBS_POST` (0x12) | Store message in channel BBS; unicast confirmation to sender |
+| `BBS_REQ` (0x13) | Fetch stored BBS messages; unicast response to requester |
+| `BBS_RSP` (0x14) | **Unicast to requester only** — delivers stored message array |
 
 Stale subscriptions (idle > TTL) are pruned every 30 seconds in the background.
 Scan sessions expire after 60 seconds.
@@ -401,6 +453,9 @@ The JSON "codec" field specifies encoding: "opus" (compressed) or "pcm" (raw int
 | SCAN_RSP | 0x07 | `n` · `p` · `sid` · `u` user-list · `mc` msg-count · `ts` | Scan reply |
 | JOIN | 0x10 | `n` · `p` · `ts` | Relay: subscribe |
 | LEAVE | 0x11 | `n` · `p` · `ts` | Relay: unsubscribe |
+| BBS_POST | 0x12 | `n` nick · `p` channel · `t` text · `ts` | Store BBS message |
+| BBS_REQ | 0x13 | `n` · `p` · `ts` | Request BBS messages for channel |
+| BBS_RSP | 0x14 | `p` · `msgs` [{id, n, p, t, ts}, …] | BBS message delivery |
 
 ### Multicast address mapping (LAN mode)
 
@@ -466,6 +521,8 @@ sudo ufw allow 5073:5326/udp
 | GPS auto-channel | Resolve coordinates → postal code → auto-join nearest channel |
 | TNC / APRS bridge | Encode messages as AX.25 UI frames for RF transmission |
 | Relay clustering | Multiple relay nodes sharing a channel registry over a message bus |
+| ~~BBS~~ | ✅ Built-in since v1.7.1 — persistent per-channel bulletin board on the relay |
+| ~~Country context~~ | ✅ Built-in since v1.8.1 — `/country CODE` filters region labels; auto-set by `--auto-channel` |
 
 ---
 

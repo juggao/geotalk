@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.6.0
+geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.8.0
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Bridges GeoTalk UDP traffic across subnets and the internet.
@@ -12,6 +12,12 @@ their JSON header ("opus" or "pcm") which is forwarded untouched.
 Clients negotiate codec capability independently; the relay never
 decodes or re-encodes audio payloads.
 
+BBS (Bulletin Board System)
+  Per-channel persistent message store.  Clients post with PKT_BBS_POST
+  and fetch with PKT_BBS_REQ; the relay delivers stored messages via
+  PKT_BBS_RSP.  Messages are auto-delivered when a client joins a channel.
+  Storage is in memory (capped per channel) with optional JSON persistence.
+
 Supported packet types
   0x01  TEXT       fan-out to channel subscribers
   0x02  AUDIO      fan-out to channel subscribers  (Opus or PCM, transparent)
@@ -21,6 +27,9 @@ Supported packet types
   0x07  SCAN_RSP   unicast back to original requester only
   0x10  JOIN       subscribe this client to a channel
   0x11  LEAVE      unsubscribe this client from all channels
+  0x12  BBS_POST   store a message in the channel BBS
+  0x13  BBS_REQ    request stored BBS messages for a channel
+  0x14  BBS_RSP    relay → client: deliver stored BBS messages
 
 Usage
   python3 geotalk-relay.py [options]
@@ -30,13 +39,17 @@ Options
   --port PORT          UDP port     (default 5073)
   --ttl  SECONDS       Client subscription TTL (default 300)
   --max-per-channel N  Max clients per channel  (default 128)
+  --bbs-file PATH      JSON file for BBS persistence (default: geotalk-bbs.json)
+  --bbs-max N          Max BBS messages per channel (default 50)
   --log-file PATH      Append log lines to file (default: stdout only)
   --quiet              Suppress per-packet log lines
 
 Console commands (type while running)
-  stats               Short summary: clients, channels, traffic
+  stats               Short summary: clients, channels, traffic, BBS
   channels            Detailed per-channel listing
   clients             All connected clients
+  bbs [CHANNEL]       List BBS messages (all channels or one specific)
+  bbs-clear CHANNEL   Delete all BBS messages for a channel
   kick NICK           Drop a client by nickname
   ban IP              Block an IP address
   unban IP            Remove an IP ban
@@ -57,13 +70,14 @@ import json
 import argparse
 import logging
 import queue as _queue
+import collections
 from collections import defaultdict
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "1.6.0"
+VERSION  = "1.8.2"
 MAGIC    = b"GT"
 BUF_SIZE = 65536   # large enough for any codec frame (Opus ~80 B, PCM ~4 KB)
 
@@ -76,6 +90,10 @@ PKT_SCAN_REQ = 0x06
 PKT_SCAN_RSP = 0x07
 PKT_JOIN     = 0x10
 PKT_LEAVE    = 0x11
+# BBS — persistent per-channel bulletin board
+PKT_BBS_POST = 0x12   # client → relay: store a BBS message
+PKT_BBS_REQ  = 0x13   # client → relay: request stored messages for a channel
+PKT_BBS_RSP  = 0x14   # relay → client: deliver stored messages
 
 PKT_NAMES = {
     PKT_TEXT:     "TEXT",
@@ -86,6 +104,9 @@ PKT_NAMES = {
     PKT_SCAN_RSP: "SCAN_RSP",
     PKT_JOIN:     "JOIN",
     PKT_LEAVE:    "LEAVE",
+    PKT_BBS_POST: "BBS_POST",
+    PKT_BBS_REQ:  "BBS_REQ",
+    PKT_BBS_RSP:  "BBS_RSP",
 }
 
 # ANSI colours
@@ -352,6 +373,133 @@ class ClientRegistry:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BBS STORE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BbsStore:
+    """
+    Persistent per-channel bulletin board.
+
+    Messages are kept in memory (deque, capped at max_per_channel) and
+    optionally persisted to a JSON file so they survive relay restarts.
+
+    Each message record:
+        {"id": int, "n": nick, "p": channel, "t": text, "ts": unix_timestamp}
+    """
+
+    def __init__(self, max_per_channel: int = 50, bbs_file: str = ""):
+        self._lock            = threading.RLock()
+        self._store           : dict[str, collections.deque] = defaultdict(
+            lambda: collections.deque(maxlen=self.max_per_channel))
+        self.max_per_channel  = max_per_channel
+        self.bbs_file         = bbs_file
+        self._next_id         = 1
+
+        if bbs_file:
+            self._load()
+
+    # ── persistence ──────────────────────────────────────────────────────
+
+    def _load(self):
+        try:
+            with open(self.bbs_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            with self._lock:
+                for channel, msgs in data.get("channels", {}).items():
+                    dq = collections.deque(maxlen=self.max_per_channel)
+                    for m in msgs:
+                        dq.append(m)
+                        if m.get("id", 0) >= self._next_id:
+                            self._next_id = m["id"] + 1
+                    self._store[channel] = dq
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"{YL}BBS: could not load {self.bbs_file}: {e}{R}")
+
+    def _save(self):
+        if not self.bbs_file:
+            return
+        try:
+            with self._lock:
+                data = {"channels": {ch: list(msgs)
+                                     for ch, msgs in self._store.items()
+                                     if msgs}}
+            with open(self.bbs_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"{YL}BBS: could not save {self.bbs_file}: {e}{R}")
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def post(self, nick: str, channel: str, text: str) -> dict:
+        """Store one message; returns the saved record."""
+        record = {
+            "id": self._next_id,
+            "n":  nick,
+            "p":  channel,
+            "t":  text,
+            "ts": int(time.time()),
+        }
+        with self._lock:
+            self._next_id += 1
+            self._store[channel].append(record)
+        self._save()
+        return record
+
+    def get(self, channel: str) -> list[dict]:
+        """Return all stored messages for a channel (oldest first)."""
+        with self._lock:
+            return list(self._store.get(channel, []))
+
+    def clear(self, channel: str) -> int:
+        """Delete all messages for a channel; returns count removed."""
+        with self._lock:
+            n = len(self._store.get(channel, []))
+            self._store.pop(channel, None)
+        self._save()
+        return n
+
+    def channel_count(self) -> int:
+        with self._lock:
+            return sum(1 for msgs in self._store.values() if msgs)
+
+    def total_count(self) -> int:
+        with self._lock:
+            return sum(len(msgs) for msgs in self._store.values())
+
+    def summary(self) -> str:
+        with self._lock:
+            active = {ch: list(msgs) for ch, msgs in self._store.items() if msgs}
+        if not active:
+            return "  (no BBS messages stored)"
+        lines = [f"{B}BBS ({sum(len(v) for v in active.values())} messages, "
+                 f"{len(active)} channel(s)){R}"]
+        for ch, msgs in sorted(active.items()):
+            last_ts = msgs[-1]["ts"] if msgs else 0
+            try:
+                last_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_ts))
+            except Exception:
+                last_str = "?"
+            lines.append(f"  {CY}#{ch:<22}{R} [{len(msgs)} msg(s)]  "
+                         f"last: {DM}{last_str}{R}")
+        return "\n".join(lines)
+
+    def detail(self, channel: str) -> str:
+        msgs = self.get(channel)
+        if not msgs:
+            return f"  (no BBS messages for #{channel})"
+        lines = [f"{B}BBS #{channel}{R}  ({len(msgs)} message(s))"]
+        for m in msgs:
+            try:
+                ts_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(m["ts"]))
+            except Exception:
+                ts_str = "?"
+            lines.append(f"  {DM}{ts_str}{R}  {B}{CY}[{m['n']}]{R}  {m['t']}")
+        return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -381,11 +529,13 @@ def _ts() -> str:
 class RelayServer:
     def __init__(self, host: str, port: int,
                  ttl: int = 300, max_per_channel: int = 128,
-                 log_file: str = "", quiet: bool = False):
+                 log_file: str = "", quiet: bool = False,
+                 bbs_max: int = 50, bbs_file: str = ""):
         self.host       = host
         self.port       = port
         self.quiet      = quiet
         self.registry   = ClientRegistry(ttl=ttl, max_per_channel=max_per_channel)
+        self.bbs        = BbsStore(max_per_channel=bbs_max, bbs_file=bbs_file)
         self._running   = False
         self._sock      : socket.socket | None = None
         self._send_lock = threading.Lock()
@@ -469,7 +619,8 @@ class RelayServer:
 {B}{CY}  ╚██████╔╝ ███████╗ ╚██████╔╝    ██║    ██║  ██║ ███████╗ ██║  ██╗{R}
 {B}{CY}   ╚═════╝  ╚══════╝  ╚═════╝     ╚═╝    ╚═╝  ╚═╝ ╚══════╝ ╚═╝  ╚═╝{R}
 {DM}  📡  Relay Server  v{VERSION}   UDP :{self.port}{R}
-  {DM}Commands: stats · channels · clients · kick · ban · quit{R}
+  {DM}BBS: {self.bbs.bbs_file or 'in-memory only'}  (max {self.bbs.max_per_channel}/channel){R}
+  {DM}Commands: stats · channels · clients · bbs · kick · ban · quit{R}
 """)
 
     # ── packet handler ────────────────────────────────────────────────────
@@ -556,6 +707,42 @@ class RelayServer:
                        PKT_NAMES.get(ptype, hex(ptype)), nick, postal)
             return
 
+        # ── BBS_POST — store message, unicast confirmation ────────────────
+        if ptype == PKT_BBS_POST:
+            if not postal or not nick:
+                return
+            text = meta.get("t", "").strip()
+            if not text:
+                return
+            record = self.bbs.post(nick, postal, text)
+            # Echo the stored record back to sender as confirmation
+            rsp_payload = json.dumps({
+                "p": postal, "msgs": [record], "echo": True
+            }).encode()
+            rsp = MAGIC + bytes([PKT_BBS_RSP]) + struct.pack("!H", len(rsp_payload)) + rsp_payload
+            self._sendto(rsp, addr)
+            if not self.quiet:
+                print(f"{DM}{_ts()}{R} {MG}BBS_POST{R} "
+                      f"{GR}{nick}{R} → {CY}#{postal}{R}  "
+                      f"{DM}\"{text[:50]}\"{R}")
+            self._logf("BBS_POST nick=%s channel=%s text=%s", nick, postal, text[:80])
+            return
+
+        # ── BBS_REQ — deliver stored messages to requester ────────────────
+        if ptype == PKT_BBS_REQ:
+            if not postal:
+                return
+            msgs = self.bbs.get(postal)
+            rsp_payload = json.dumps({"p": postal, "msgs": msgs}).encode()
+            rsp = MAGIC + bytes([PKT_BBS_RSP]) + struct.pack("!H", len(rsp_payload)) + rsp_payload
+            self._sendto(rsp, addr)
+            if not self.quiet:
+                print(f"{DM}{_ts()}{R} {MG}BBS_REQ{R}  "
+                      f"{nick or addr[0]} → {CY}#{postal}{R}  "
+                      f"{DM}({len(msgs)} msg(s) delivered){R}")
+            self._logf("BBS_REQ nick=%s channel=%s msgs=%d", nick, postal, len(msgs))
+            return
+
         # Unknown — drop silently but log
         self._logf("UNKNOWN ptype=0x%02x addr=%s:%s", ptype, addr[0], addr[1])
 
@@ -601,10 +788,22 @@ class RelayServer:
 
             if cmd == "stats":
                 print(self.registry.stats_summary())
+                print(self.bbs.summary())
             elif cmd == "channels":
                 print(self.registry.channels_detail())
             elif cmd in ("clients", "who"):
                 print(self.registry.clients_detail())
+            elif cmd == "bbs":
+                if arg:
+                    print(self.bbs.detail(arg.upper()))
+                else:
+                    print(self.bbs.summary())
+            elif cmd in ("bbs-clear", "bbsclear"):
+                if not arg:
+                    print(f"{YL}Usage: bbs-clear CHANNEL{R}")
+                else:
+                    n = self.bbs.clear(arg.upper())
+                    print(f"{GR}Cleared {n} BBS message(s) from #{arg.upper()}{R}")
             elif cmd == "kick":
                 if not arg:
                     print(f"{YL}Usage: kick NICK{R}")
@@ -631,8 +830,8 @@ class RelayServer:
                 self._running = False
                 break
             else:
-                print(f"{YL}Commands: stats  channels  clients  "
-                      f"kick NICK  ban IP  unban IP  bans  quit{R}")
+                print(f"{YL}Commands: stats  channels  clients  bbs [CHANNEL]  "
+                      f"bbs-clear CHANNEL  kick NICK  ban IP  unban IP  bans  quit{R}")
 
     # ── log helper ────────────────────────────────────────────────────────
 
@@ -669,6 +868,13 @@ Examples:
                         help="Append structured log lines to this file")
     parser.add_argument("--quiet",           action="store_true",
                         help="Suppress per-packet console output")
+    parser.add_argument("--bbs-file",        default="geotalk-bbs.json",
+                        metavar="PATH",
+                        help="JSON file for BBS persistence (default: geotalk-bbs.json, "
+                             "use '' to disable)")
+    parser.add_argument("--bbs-max",         type=int, default=50,
+                        metavar="N",
+                        help="Max BBS messages stored per channel (default 50)")
     args = parser.parse_args()
 
     RelayServer(
@@ -678,6 +884,8 @@ Examples:
         max_per_channel = args.max_per_channel,
         log_file        = args.log_file,
         quiet           = args.quiet,
+        bbs_max         = args.bbs_max,
+        bbs_file        = args.bbs_file,
     ).start()
 
 
