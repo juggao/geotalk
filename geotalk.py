@@ -41,7 +41,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "1.4.1"
+VERSION      = "1.5.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 4096
@@ -2472,6 +2472,90 @@ BANNER = f"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IP → POSTAL CODE AUTO-DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_postal_from_ip(timeout: float = 5.0) -> tuple[str, str, str]:
+    """
+    Detect the user's approximate postal code from their public IP address.
+
+    Strategy
+    --------
+    1. Try ip-api.com  (free, no key, returns postal + city + country in JSON)
+    2. Try ipinfo.io   (free tier fallback)
+    3. Return ("", "", "") if both fail.
+
+    Returns (postal, city, country_code)  e.g. ("5944", "Tegelen", "NL")
+    """
+    import urllib.request as _req
+    import json as _json
+
+    endpoints = [
+        (
+            "http://ip-api.com/json/?fields=status,zip,city,countryCode",
+            lambda d: (d.get("zip",""), d.get("city",""), d.get("countryCode",""))
+                      if d.get("status") == "success" else ("","","")
+        ),
+        (
+            "https://ipinfo.io/json",
+            lambda d: (d.get("postal",""), d.get("city",""), d.get("country",""))
+        ),
+    ]
+
+    for url, extract in endpoints:
+        try:
+            req = _req.Request(url, headers={"User-Agent": f"GeoTalk/{VERSION}"})
+            with _req.urlopen(req, timeout=timeout) as resp:
+                data = _json.loads(resp.read().decode())
+            postal, city, cc = extract(data)
+            postal = postal.strip().upper().replace(" ", "").replace("-", "")
+            if postal:
+                return postal, city, cc
+        except Exception:
+            continue
+
+    return "", "", ""
+
+
+def _best_auto_channel(postal: str) -> str:
+    """
+    Given a raw postal code from IP geolocation, return the most useful
+    GeoTalk channel glob to auto-join.
+
+    Walks the entire DB and picks the entry with the longest fixed prefix
+    that still matches the postal code — i.e. the most specific region.
+    Falls back to a 3-char prefix glob, then the raw code as exact channel.
+    """
+    if not postal:
+        return ""
+    postal_norm = postal.strip().upper()
+
+    best_prefix = ""
+    for db_pat, cc, label in _GEO_REGIONS:
+        prefix = db_pat.rstrip("?*")
+        if not prefix:
+            continue
+        # Only consider entries whose fixed prefix matches the start of postal
+        if not postal_norm.startswith(prefix):
+            continue
+        try:
+            pat = ChannelPattern(db_pat.replace("?", "*"))
+            if pat.matches(postal_norm) and len(prefix) > len(best_prefix):
+                best_prefix = prefix
+        except ValueError:
+            pass
+
+    if best_prefix:
+        return best_prefix + "**"
+
+    # Fall back to 3-char prefix glob
+    if len(postal_norm) >= 3:
+        return postal_norm[:3] + "**"
+
+    return postal_norm
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2500,6 +2584,10 @@ Examples:
 
   # Join channels on startup
   python3 geotalk.py --nick PA3XYZ --relay relay.example.com --join 59** 1***??
+
+  # Auto-join based on your public IP location
+  python3 geotalk.py --nick PA3XYZ --auto-channel
+  python3 geotalk.py --nick PA3XYZ --relay relay.example.com --auto-channel
 """)
     parser.add_argument("--nick",       default="",
                         help="Your callsign/nickname")
@@ -2518,8 +2606,10 @@ Examples:
     parser.add_argument("--relay-port", type=int, default=DEFAULT_PORT,
                         metavar="PORT",
                         help=f"Relay server UDP port (default {DEFAULT_PORT})")
-    parser.add_argument("--join",       nargs="*", metavar="PATTERN",
+    parser.add_argument("--join",         nargs="*", metavar="PATTERN",
                         help="Channel patterns to join on startup (e.g. 59** 1***??)")
+    parser.add_argument("--auto-channel", action="store_true",
+                        help="Detect location from public IP and auto-join nearest postal channel")
     args = parser.parse_args()
 
     # ── pick callsign ─────────────────────────────────────────────────────
@@ -2551,11 +2641,24 @@ Examples:
         print(f"  {DM}For internet use, add --relay <host>  •  "
               f"For Wi-Fi, add --local-if <your-IP>{R}\n")
 
+    # ── auto-channel: detect location from public IP ─────────────────────
+    if args.auto_channel:
+        print(f"{DM}  Detecting location from public IP\u2026{R}", end="", flush=True)
+        postal, city, cc = detect_postal_from_ip()
+        if postal:
+            channel = _best_auto_channel(postal)
+            city_str = f"{city}, {cc}" if city else cc
+            print(f"\r  {GR}Location detected:{R} {postal} ({city_str})  \u2192  auto-joining #{channel}")
+            print(gt.join_channel(channel))
+        else:
+            print(f"\r  {YL}Could not detect location from IP (VPN? offline?){R}  "
+                  f"\u2014 use {YL}#POSTCODE{R} to join manually")
+
     # ── auto-join channels ────────────────────────────────────────────────
     if args.join:
         for raw in args.join:
             print(gt.join_channel(raw))
-    else:
+    elif not args.auto_channel:
         print(f"{DM}Tip: {YL}#59**{DM} = Venlo region  •  {YL}#1***??{DM} = Amsterdam  •  {YL}/help{DM} for all commands{R}\n")
 
     # ── signal handler ────────────────────────────────────────────────────

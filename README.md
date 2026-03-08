@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.4.1**
+**Version 1.5.0**
 
 ---
 
@@ -28,6 +28,7 @@ via a relay server.
 | 🔒 | LAN mode | Pure peer-to-peer UDP multicast, zero infrastructure required |
 | 🔊 | Audio mixing | Simultaneous speakers are mixed in real time — no garbled interleaving |
 | 🏙️ | Postal reverse lookup | `/postal Venlo` finds all matching channel patterns by city name |
+| 📍 | Auto-channel | `--auto-channel` detects your location from public IP and joins the nearest channel automatically |
 
 ---
 
@@ -77,6 +78,23 @@ python3 geotalk.py --nick PA3XYZ --relay relay.example.com
 python3 geotalk.py --nick PA3XYZ --relay 1.2.3.4 --relay-port 5073 --join 59** 750**
 ```
 
+### Auto-channel — let GeoTalk find your location
+
+```bash
+# Detects your public IP, resolves it to a postal region, and joins automatically
+python3 geotalk.py --nick PA3XYZ --auto-channel
+python3 geotalk.py --nick PA3XYZ --relay relay.example.com --auto-channel
+```
+
+On startup you'll see:
+```
+  Location detected: 5944 (Tegelen, NL)  →  auto-joining #59**
+  Joined #59**  → mcast=239.73.x.x:5156 + 128 sub-groups
+```
+
+Uses ip-api.com (primary) and ipinfo.io (fallback) — both free, no API key required.
+If detection fails (VPN, offline) a message is shown and you can join manually with `#POSTCODE`.
+
 ---
 
 ## Testing on One Machine
@@ -119,6 +137,7 @@ python3 geotalk.py --nick BOB   --local-if 192.168.178.164 --debug
 --relay HOST          Relay server hostname or IP  ← enables relay mode
 --relay-port PORT     Relay server port (default 5073)
 --join PATTERN ...    Channels to join on startup
+--auto-channel        Detect location from public IP and auto-join nearest channel
 --debug               Print verbose multicast debug lines to stderr
 ```
 
@@ -182,7 +201,7 @@ Full Python regex syntax enclosed in `/` `/`.
 ```
 
 Responses stream live as peers reply. A summary table is printed at the end.
-Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+).
+Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+).
 
 ### Channel management
 ```
