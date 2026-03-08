@@ -31,6 +31,7 @@ via a relay server.
 | 📍 | Auto-channel | `--auto-channel` detects your location from public IP and joins the nearest channel automatically |
 | 📋 | BBS | `/bbs TEXT` posts a persistent message to the channel bulletin board; messages are auto-delivered on join (relay mode only) |
 | 🌍 | Country context | `/country NL` filters all region labels to one country — no cross-country noise on shared postal prefixes |
+| 🖥️ | Desktop GUI | `geotalk-gui.py` — tkinter interface with channel sidebar, PTT button, message log, REPL, status bar, and saved settings |
 
 ---
 
@@ -40,6 +41,7 @@ via a relay server.
 |---|---|
 | `geotalk.py` | Client — text, PTT, channel management, scan |
 | `geotalk-relay.py` | Relay server — internet bridge, runs on a VPS |
+| `geotalk-gui.py` | Desktop GUI — tkinter frontend for the GeoTalk client |
 
 ---
 
@@ -56,6 +58,10 @@ pip3 install pyaudio --break-system-packages
 
 # On Debian / Ubuntu you may also need:
 sudo apt install portaudio19-dev python3-pyaudio
+
+# GUI — requires only tkinter (included in standard Python on most distros).
+# On Debian / Ubuntu if tkinter is missing:
+sudo apt install python3-tk
 
 # For Opus codec (recommended — ~24x bandwidth reduction over raw PCM):
 pip3 install opuslib --break-system-packages
@@ -101,6 +107,88 @@ On startup you'll see:
 
 Uses ip-api.com (primary) and ipinfo.io (fallback) — both free, no API key required.
 If detection fails (VPN, offline) a message is shown and you can join manually with `#POSTCODE`.
+
+---
+
+## Desktop GUI
+
+`geotalk-gui.py` is a tkinter frontend that wraps the full GeoTalk client in a
+graphical interface. It imports `geotalk.py` directly — no subprocess, same
+process — so all features are available: PTT, relay, scan, BBS, country context.
+
+### Starting the GUI
+
+```bash
+# Must be in the same directory as geotalk.py
+python3 geotalk-gui.py
+
+# Or with PYTHONPATH if geotalk.py is elsewhere
+PYTHONPATH=/path/to/geotalk python3 geotalk-gui.py
+```
+
+On first launch a connect dialog appears. Fill in your details and click **CONNECT**.
+All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the next launch.
+
+### Connect dialog fields
+
+| Field | Description |
+|---|---|
+| Callsign / nick | Your display name on the air |
+| Relay host | Hostname or IP of relay server — leave empty for LAN multicast |
+| Relay port | Default `5073` |
+| Join on start | Space-separated channels to join immediately, e.g. `59** 1***??` |
+| Interface IP | Local interface for multicast (leave empty for auto) |
+| Country | Region label filter — default `NL` |
+| Auto-channel | Detect location from public IP and join nearest channel automatically |
+
+### Layout
+
+```
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.8.2 ─┐
+├──────────────┬──────────────────────────────────────────────────────┤
+│ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
+│              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
+│ ► #59**  (2) │  10:33 ▶ PTT ON                                    │
+│   #5911AB    ├──────────────────────────────────────────────────────┤
+│              │ ➤  /scan 59**_                                      │
+│ [join entry] │                                                     │
+├──────────────┴──────────────────────────────────────────────────────┤
+│  ● PTT   ◉ MUTE │  CH: #59**   users: CHARLIE, BOB   msgs: 7      │
+│                  │  country: NL   2 channels              LAN MCAST │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Channels sidebar** — lists all joined channels with active user count. Click any
+channel to switch the active TX channel. Type a pattern in the join box and press
+Enter to join. The active channel is marked with `►`.
+
+**Messages area** — inbound text messages, voice notifications, system output, scan
+results, and BBS messages are colour-coded. Text messages are parsed into
+timestamped `[NICK] (region) #channel: body` format.
+
+**REPL input** — full access to all `/command` syntax. Command history with `↑` / `↓`.
+
+**PTT button** — large push-and-hold button. Hold to transmit, release to stop.
+
+**Status bar** — shows active channel, online users, message count, PTT/mute state,
+country, channel count, and transport mode (LAN MCAST or RELAY).
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `Space` (outside REPL) | PTT push-to-talk (hold) |
+| `Ctrl+T` | Toggle PTT on/off |
+| `Ctrl+M` | Toggle audio mute |
+| `↑` / `↓` in REPL | Navigate command history |
+| `Escape` | Focus the REPL input |
+
+### Saved settings
+
+All connect dialog fields are persisted to `~/.config/geotalk/prefs.json`.
+Window size and position are also saved and restored on next launch.
+Settings are written only on successful connect — cancelling the dialog
+does not overwrite previously saved settings.
 
 ---
 
@@ -523,6 +611,7 @@ sudo ufw allow 5073:5326/udp
 | Relay clustering | Multiple relay nodes sharing a channel registry over a message bus |
 | ~~BBS~~ | ✅ Built-in since v1.7.1 — persistent per-channel bulletin board on the relay |
 | ~~Country context~~ | ✅ Built-in since v1.8.1 — `/country CODE` filters region labels; auto-set by `--auto-channel` |
+| ~~Desktop GUI~~ | ✅ Built-in since v1.8.2 — `geotalk-gui.py` tkinter frontend with PTT, channel sidebar, saved settings |
 
 ---
 
