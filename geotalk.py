@@ -4,6 +4,8 @@ GeoTalk - Pseudo-HAM Radio & Text Messaging over UDP
 Geo-grouped by postal code (Europe-focused)
 Usage: python3 geotalk.py [--host 0.0.0.0] [--port 5000] [--nick CALLSIGN]
 
+Author: René Oudeweg / Claude
+
 Channel syntax
   Exact:    #5911AB  #59601  #75001
   Wildcard: #59**    #5***   #75***  (glob-style, * = any digit/char)
@@ -17,6 +19,7 @@ import fnmatch
 import socket
 import threading
 import queue
+import collections
 import time
 import json
 import struct
@@ -38,7 +41,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION        = "1.3.1"
+VERSION      = "1.4.1"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 4096
@@ -956,16 +959,42 @@ class MulticastSocket:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AudioEngine:
-    """Capture mic → UDP / play incoming UDP PCM streams."""
+    """
+    Capture mic → UDP / mix and play incoming UDP PCM streams.
+
+    Mixing
+    ──────
+    Each remote sender gets its own ring buffer (deque of PCM chunks).
+    A dedicated mixer thread wakes every AUDIO_CHUNK/AUDIO_RATE seconds
+    (one frame period, ~64 ms at 16 kHz / 1024 samples).  It grabs the
+    oldest chunk from every active sender, converts to int16 arrays, sums
+    them sample-by-sample with saturation clipping to ±32767, and writes
+    the single mixed frame to the output stream.
+
+    Senders that have not delivered a chunk within MIXER_SENDER_TIMEOUT
+    seconds are considered silent and skipped.  This handles the common
+    case where Alice stops talking before the mixer tick — her buffer goes
+    empty, only Bob's audio is mixed, and there is no glitch.
+    """
+
+    # How many chunks to buffer per sender before dropping (back-pressure)
+    SENDER_QUEUE_DEPTH = 8
+    # Seconds after last packet before a sender is evicted from the mixer
+    SENDER_TIMEOUT     = 2.0
+    # Mixer tick interval — should match one frame period
+    MIXER_TICK         = AUDIO_CHUNK / AUDIO_RATE   # ~0.064 s
 
     def __init__(self):
-        self.pa       = None
-        self.rx_queue = queue.Queue(maxsize=200)   # incoming PCM chunks
-        self._ptt     = False
-        self._muted   = False
-        self._running = False
-        self._tx_cb   = None   # called with (pcm_bytes, seq)
-        self._seq     = 0
+        self.pa        = None
+        self._ptt      = False
+        self._muted    = False
+        self._running  = False
+        self._tx_cb    = None   # called with (pcm_bytes, seq)
+        self._seq      = 0
+
+        # Per-sender state  {nick: {"buf": deque, "last": float}}
+        self._senders: dict[str, dict] = {}
+        self._sender_lock = threading.Lock()
 
         if AUDIO_AVAILABLE:
             try:
@@ -1001,9 +1030,9 @@ class AudioEngine:
             rate=AUDIO_RATE, input=True,
             frames_per_buffer=AUDIO_CHUNK,
             stream_callback=self._capture_cb)
-        self._rx_thread = threading.Thread(target=self._rx_loop,
-                                           daemon=True, name="rx-audio")
-        self._rx_thread.start()
+        self._mixer_thread = threading.Thread(target=self._mixer_loop,
+                                              daemon=True, name="mixer")
+        self._mixer_thread.start()
 
     def _capture_cb(self, in_data, frame_count, time_info, status):
         import pyaudio as _pa
@@ -1012,15 +1041,71 @@ class AudioEngine:
             self._seq += 1
         return (None, _pa.paContinue)
 
-    def _rx_loop(self):
+    # ── mixer ─────────────────────────────────────────────────────────────
+
+    def _mixer_loop(self):
+        """
+        Tick once per frame period.  Collect one chunk from every active
+        sender, mix by summing int16 samples with clipping, write to output.
+        If no sender has audio, write silence so the stream stays open.
+        """
+        import struct as _struct
+        n_samples = AUDIO_CHUNK
+        silence   = b"\x00" * (n_samples * 2)   # int16 = 2 bytes per sample
+        tick      = self.MIXER_TICK
+
         while self._running:
-            try:
-                pcm = self.rx_queue.get(timeout=0.2)
-                self._rx_stream.write(pcm)
-            except queue.Empty:
-                pass
-            except Exception:
-                break
+            tick_start = time.monotonic()
+
+            chunks    = []   # list of bytes chunks to mix this tick
+            evict     = []
+
+            with self._sender_lock:
+                now = time.monotonic()
+                for nick, state in list(self._senders.items()):
+                    if now - state["last"] > self.SENDER_TIMEOUT:
+                        evict.append(nick)
+                        continue
+                    buf = state["buf"]
+                    if buf:
+                        chunks.append(buf.popleft())
+
+                for nick in evict:
+                    del self._senders[nick]
+
+            if not self._muted and chunks:
+                if len(chunks) == 1:
+                    mixed = chunks[0]
+                else:
+                    # Unpack all chunks to int16 lists and sum with clipping
+                    fmt      = f"<{n_samples}h"
+                    arrays   = [list(_struct.unpack(fmt, c[:n_samples * 2]))
+                                for c in chunks]
+                    mixed_s  = [
+                        max(-32768, min(32767, sum(arrays[s][i]
+                                                   for s in range(len(arrays)))))
+                        for i in range(n_samples)
+                    ]
+                    mixed = _struct.pack(f"<{n_samples}h", *mixed_s)
+
+                try:
+                    self._rx_stream.write(mixed)
+                except Exception:
+                    pass
+            else:
+                # No audio this tick — write silence to prevent underrun
+                try:
+                    self._rx_stream.write(silence)
+                except Exception:
+                    pass
+
+            # Sleep for the remainder of the tick period
+            elapsed = time.monotonic() - tick_start
+            sleep_t = tick - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+    # ── public API ────────────────────────────────────────────────────────
 
     def push_ptt(self):
         self._ptt = True
@@ -1038,13 +1123,24 @@ class AudioEngine:
     def is_muted(self) -> bool:
         return self._muted
 
-    def feed_audio(self, pcm: bytes):
+    def feed_audio(self, pcm: bytes, nick: str = ""):
+        """
+        Deliver a PCM chunk from `nick` into that sender's ring buffer.
+        The mixer thread will pick it up on the next tick.
+        """
         if self._muted:
-            return   # discard incoming audio while muted
-        try:
-            self.rx_queue.put_nowait(pcm)
-        except queue.Full:
-            pass   # drop if buffer full — tolerable for voice
+            return
+        if not nick:
+            nick = "_unknown_"
+        with self._sender_lock:
+            if nick not in self._senders:
+                self._senders[nick] = {
+                    "buf":  collections.deque(maxlen=self.SENDER_QUEUE_DEPTH),
+                    "last": time.monotonic(),
+                }
+            state = self._senders[nick]
+            state["buf"].append(pcm)
+            state["last"] = time.monotonic()
 
     def stop(self):
         self._running = False
@@ -2042,7 +2138,7 @@ class GeoTalk:
         elif pkt["type"] == "audio":
             if self._ptt_held:
                 return   # we are transmitting — discard incoming audio from others
-            self.audio.feed_audio(pkt.get("pcm", b""))
+            self.audio.feed_audio(pkt.get("pcm", b""), nick=nick)
             if not self.audio.is_muted:
                 sys.stdout.write(
                     f"\r{DM}{ts}{R} {MG}[VOICE]{R} "
@@ -2137,6 +2233,8 @@ HELP_TEXT = f"""
 {B}Region lookup{R}
   {YL}/lookup 59**{R}       Show all known sub-regions for a pattern
   {YL}/lookup 5911AB{R}     Look up exact postal code region
+  {YL}/postal Venlo{R}      Reverse lookup: find postal patterns by city or region name
+  {YL}/postal Amsterdam{R}  Works for any EU city in the region database
 
 {B}Voice / PTT{R}
   {YL}/ptt on{R}            Push-to-talk ON  (mic → multicast)
@@ -2217,6 +2315,47 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
                      f"({pat.kind})  "
                      f"mcast={postal_to_multicast(pat.key)}:{postal_to_port(pat.key)}"]
             lines.append(expand_wildcard_info(pat))
+            return "\n".join(lines)
+
+        if cmd0 == "postal":
+            if len(parts) < 2:
+                return (f"{YL}Usage: /postal CITY_OR_REGION{R}\n"
+                        f"  e.g.  /postal Venlo\n"
+                        f"        /postal Amsterdam\n"
+                        f"        /postal Paris\n"
+                        f"        /postal Berlin")
+            query = " ".join(parts[1:]).strip().lower()
+            hits = []
+            seen_pat: set[str] = set()
+            for db_pat, cc, label in _GEO_REGIONS:
+                if query in label.lower() and db_pat not in seen_pat:
+                    seen_pat.add(db_pat)
+                    # Build the channel pattern from the DB entry
+                    # Strip trailing ? and * to get the shortest useful prefix
+                    prefix = db_pat.rstrip("?*")
+                    # Suggest a usable glob: prefix + ** if wildcards were stripped
+                    if db_pat != prefix:
+                        suggestion = prefix + "**"
+                    else:
+                        suggestion = db_pat
+                    hits.append((cc, label, db_pat, suggestion))
+
+            if not hits:
+                return (f"{YL}No regions found matching '{query}'.{R}\n"
+                        f"  Try a broader term, e.g. /postal Venlo, /postal Paris, /postal Berlin")
+
+            lines = [f"{B}Postal lookup: '{query}'{R}  ({len(hits)} result{'s' if len(hits) != 1 else ''})\n"]
+            prev_cc = None
+            for cc, label, db_pat, suggestion in sorted(hits, key=lambda x: (x[0], x[1])):
+                if cc != prev_cc:
+                    lines.append(f"{DM}── {cc} ──────────────────────{R}")
+                    prev_cc = cc
+                lines.append(
+                    f"  {B}{CY}#{suggestion:<14}{R}  "
+                    f"{DM}(pattern: {db_pat}){R}  "
+                    f"{label}"
+                )
+            lines.append(f"\n{DM}Tip: use #{suggestion} to join, or /scan {suggestion} to find active users{R}")
             return "\n".join(lines)
 
         if cmd0 == "help":

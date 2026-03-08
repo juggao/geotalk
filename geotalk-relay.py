@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.3.0
+geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.4.0
+Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Bridges GeoTalk UDP traffic across subnets and the internet.
 Clients subscribe to postal-code channels via PKT_JOIN; the relay
@@ -57,7 +58,7 @@ from collections import defaultdict
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "1.3.1"
+VERSION  = "1.4.0"
 MAGIC    = b"GT"
 BUF_SIZE = 8192
 

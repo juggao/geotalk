@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.3.1**
+**Version 1.4.1**
 
 ---
 
@@ -26,6 +26,8 @@ via a relay server.
 | 🌐 | Relay mode | `--relay HOST` for internet use — no multicast routing needed |
 | 🔄 | Auto-reconnect | Client reconnects to relay with exponential back-off |
 | 🔒 | LAN mode | Pure peer-to-peer UDP multicast, zero infrastructure required |
+| 🔊 | Audio mixing | Simultaneous speakers are mixed in real time — no garbled interleaving |
+| 🏙️ | Postal reverse lookup | `/postal Venlo` finds all matching channel patterns by city name |
 
 ---
 
@@ -146,6 +148,12 @@ All three modes use the same `#` prefix:
 
 `*` = exactly one character · `**` = one or more characters
 
+When you join a wildcard channel (e.g. `#591*`), GeoTalk automatically subscribes
+to all enumerated concrete groups within that pattern — so messages and audio from
+peers on exact channels like `#5912` or `#5913` are received without any extra steps.
+In relay mode, the client sends a `JOIN` for each concrete sub-channel; in multicast
+mode it joins each corresponding multicast group.
+
 ### Regex
 ```
 #/^59[0-9]{3}$/        all 5-digit codes starting with 59
@@ -174,7 +182,7 @@ Full Python regex syntax enclosed in `/` `/`.
 ```
 
 Responses stream live as peers reply. A summary table is printed at the end.
-Requires all peers to be on v1.3.0 or later (relay requires v1.3.1+).
+Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+).
 
 ### Channel management
 ```
@@ -191,6 +199,16 @@ Requires all peers to be on v1.3.0 or later (relay requires v1.3.1+).
 /lookup 5911AB      Show region for an exact postcode
 ```
 
+### Postal reverse lookup
+```
+/postal Venlo       Find all channel patterns covering Venlo
+/postal Amsterdam   Find channels for Amsterdam
+/postal Paris       Find channels for Paris
+/postal Berlin      Find channels for Berlin
+```
+
+Results are grouped by country, show the DB pattern and a ready-to-use glob, and end with a tip for joining or scanning. Works for any city or region name in the 120+ entry database.
+
 ### Voice / PTT
 ```
 /ptt on     Open mic → stream to active channel
@@ -203,6 +221,11 @@ Ctrl+Y      Toggle audio mute on/off
 While PTT is active, incoming audio from others is discarded (no playback,
 no REPL output) — mirrors real radio behaviour. While muted, voice packet
 lines are suppressed in the REPL but text and ping messages still appear.
+
+When multiple peers transmit simultaneously, their audio streams are mixed
+in real time before playback — each sender has an independent ring buffer,
+and a mixer thread combines them sample-by-sample with saturation clipping
+every 64 ms. You hear a clean blend rather than interleaved fragments.
 
 ### Info & status
 ```
@@ -221,7 +244,7 @@ lines are suppressed in the REPL but text and ping messages still appear.
 `/scan PATTERN` runs a three-phase probe:
 
 1. **Expand** — the pattern is matched against the 120+ entry region DB to
-   build a list of concrete channel keys to probe (up to 64), plus the
+   build a list of concrete channel keys to probe (up to 128), plus the
    wildcard key itself.
 2. **Probe** — `SCAN_REQ` (0x06) packets are multicast (or sent via relay)
    to each candidate channel in batches of 16.
@@ -411,6 +434,12 @@ sudo ufw allow 5073:5326/udp
 | GPS auto-channel | Resolve coordinates → postal code → auto-join nearest channel |
 | TNC / APRS bridge | Encode messages as AX.25 UI frames for RF transmission |
 | Relay clustering | Multiple relay nodes sharing a channel registry over a message bus |
+
+---
+
+## Author
+
+René Oudeweg / Claude
 
 ---
 
