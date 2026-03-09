@@ -375,6 +375,12 @@ class GeoTalkGUI:
             selectmode="single")
         self._chan_list.pack(fill="both", expand=True, padx=4, pady=4)
         self._chan_list.bind("<<ListboxSelect>>", self._on_chan_select)
+        # Suppress the Listbox's built-in <space> selection behaviour.
+        # Without this, pressing space while the sidebar has focus moves the
+        # Listbox selection to the first entry.  We route the event to PTT
+        # instead and return "break" to stop further propagation.
+        self._chan_list.bind("<space>",            lambda e: (self._ptt_key_down(e), "break")[-1])
+        self._chan_list.bind("<KeyRelease-space>", lambda e: (self._ptt_key_up(e),   "break")[-1])
 
         tk.Frame(sidebar, bg=P["border"], height=1).pack(fill="x", padx=6)
 
