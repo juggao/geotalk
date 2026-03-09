@@ -687,6 +687,13 @@ class GeoTalkGUI:
                             f"Join-active error: {e}"))
                 threading.Thread(target=_do_join_active, daemon=True).start()
 
+        # System channels — join #INFO and #EMERGENCY automatically in relay mode
+        if self.gt.relay_mode:
+            for ch in ("INFO", "EMERGENCY"):
+                result = self.gt.join_channel(ch)
+                if result:
+                    self._ingest_result(result)
+
         # Auto-join channels
         if cfg["join"]:
             for raw in cfg["join"].split():
