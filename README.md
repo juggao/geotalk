@@ -298,9 +298,21 @@ mode it joins each corresponding multicast group.
 
 Full Python regex syntax enclosed in `/` `/`.
 
----
+### Free-form channel names
 
-## Client Commands
+The `#` prefix accepts any string — the channel key does not have to be a postal code. This works in both relay and LAN multicast mode:
+
+```
+#LIMBURG        regional channel for the province of Limburg
+#AMSTERDAM      city-wide channel
+#REPEATER-PI4ZL link a repeater group to a GeoTalk channel
+#EMERGENCY      ad-hoc coordination channel
+#TEST           local testing
+```
+
+Any alphanumeric name (and most punctuation) is valid. The multicast address and port are derived from the raw string using the same hash as postal codes, so two peers typing `#LIMBURG` end up on exactly the same multicast group without any extra configuration. In relay mode the key is sent verbatim in `JOIN` packets.
+
+The only difference from a postal code channel is that region lookup and wildcard expansion have no database entries to match against, so `/lookup` and `/scan` will not find sub-regions — they work purely as fixed exact-match channels.
 
 ### Quick input
 ```
