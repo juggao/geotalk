@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 2.0.0**
+**Version 2.1.0**
 
 ---
 
@@ -44,8 +44,11 @@ via a relay server.
 | File | Role |
 |---|---|
 | `geotalk.py` | Client — text, PTT, channel management, scan |
-| `geotalk-relay.py` | Relay server — internet bridge, runs on a VPS |
 | `geotalk-gui.py` | Desktop GUI — tkinter frontend for the GeoTalk client |
+| `geotalk-relayd.py` | Relay daemon — UDP server with Unix-domain control socket, PID file, `--daemonize` |
+| `geotalk-relay-cli.py` | Operator CLI — connects to `geotalk-relayd` control socket; one-shot and interactive REPL |
+| `geotalk-relay-gui.py` | Operator GUI — tkinter relay management interface |
+| `geotalk-relay.py` | Legacy relay server — superseded by `geotalk-relayd.py`, kept for reference |
 
 ---
 
@@ -53,8 +56,10 @@ via a relay server.
 
 ```bash
 # Copy to PATH
-cp geotalk.py geotalk-relay.py /usr/local/bin/
-chmod +x /usr/local/bin/geotalk.py /usr/local/bin/geotalk-relay.py
+cp geotalk.py geotalk-relayd.py geotalk-relay-cli.py /usr/local/bin/
+chmod +x /usr/local/bin/geotalk.py \
+         /usr/local/bin/geotalk-relayd.py \
+         /usr/local/bin/geotalk-relay-cli.py
 
 # Python stdlib only — no mandatory dependencies.
 # For voice / PTT, install pyaudio:
@@ -88,7 +93,7 @@ python3 geotalk.py --nick PA3XYZ --join 59** 1***??
 
 ```bash
 # Step 1 — start the relay on a VPS (one-time setup)
-python3 geotalk-relay.py --port 5073
+python3 geotalk-relayd.py --port 5073
 
 # Step 2 — clients point at the relay
 python3 geotalk.py --nick PA3XYZ --relay relay.example.com
@@ -165,7 +170,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.0.0 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.1.0 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
@@ -219,7 +224,7 @@ Run the relay and two clients on the same machine using loopback:
 
 ```bash
 # Terminal 1 — relay
-python3 geotalk-relay.py --port 5073
+python3 geotalk-relayd.py --port 5073
 
 # Terminal 2 — ALICE
 python3 geotalk.py --nick ALICE --relay 127.0.0.1 --relay-port 5073
@@ -503,54 +508,80 @@ Example — NL Venlo sub-zones:
 
 ## Relay Server
 
+The relay server is `geotalk-relayd.py`. It runs as a proper background
+daemon, writes a PID file, and exposes a Unix-domain control socket so the
+operator CLI (`geotalk-relay-cli.py`) or the GUI can manage it at any time
+without restarting or attaching to its terminal.
+
+> See **[README-RELAY.md](README-RELAY.md)** for the full operator guide,
+> systemd unit, log rotation, scripting reference, and troubleshooting.
+
 ### Starting the relay
 
 ```bash
-# Minimal
-python3 geotalk-relay.py
+# Foreground (development / testing)
+python3 geotalk-relayd.py
 
-# Full options
-python3 geotalk-relay.py \
-  --host 0.0.0.0 \
-  --port 5073 \
-  --ttl 600 \
-  --max-per-channel 64 \
+# Background daemon
+python3 geotalk-relayd.py \
+  --daemonize \
+  --log-file /var/log/geotalk-relayd.log \
   --bbs-file /var/lib/geotalk/bbs.json \
-  --bbs-max 100 \
-  --log-file /var/log/geotalk-relay.log \
+  --ctl-socket /run/geotalk/relay.sock \
   --quiet
 ```
 
-### Relay CLI options
+### Relay options
 
 | Option | Default | Description |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `5073` | UDP port |
 | `--ttl` | `300` | Seconds before idle client is evicted |
-| `--max-per-channel` | `128` | Max clients per channel (anti-flood) |
-| `--log-file` | _(none)_ | Append structured log lines to a file |
-| `--quiet` | off | Suppress per-packet console output |
-| `--bbs-file` | `geotalk-bbs.json` | JSON file for BBS persistence (use `''` to disable) |
-| `--bbs-max` | `50` | Max BBS messages stored per channel |
+| `--max-per-channel` | `128` | Max clients per channel |
+| `--bbs-file` | `geotalk-bbs.json` | BBS persistence file (pass `''` to disable) |
+| `--bbs-max` | `50` | Max BBS messages per channel |
+| `--log-file` | _(stdout)_ | Append log lines to a file. Required for `--daemonize` |
+| `--quiet` | off | Suppress per-packet log lines |
+| `--ctl-socket` | `$XDG_RUNTIME_DIR/geotalk-relayd.sock` | Unix control socket path |
+| `--pid-file` | `$XDG_RUNTIME_DIR/geotalk-relayd.pid` | PID file path |
+| `--daemonize` | off | Double-fork to background (Unix only) |
 
-### Relay console commands
+### Operator CLI
 
-Type these while the relay is running:
+`geotalk-relay-cli.py` connects to the daemon's control socket and exposes
+every management command as either a one-shot invocation or an interactive
+REPL with tab completion and command history.
+
+```bash
+# One-shot
+python3 geotalk-relay-cli.py stats
+python3 geotalk-relay-cli.py clients
+python3 geotalk-relay-cli.py kick PA3XYZ
+python3 geotalk-relay-cli.py bbs-post INFO Net tonight 20:00 UTC on 1010
+python3 geotalk-relay-cli.py stop
+
+# Interactive REPL
+python3 geotalk-relay-cli.py
+python3 geotalk-relay-cli.py --socket /run/geotalk/relay.sock
+```
 
 | Command | Action |
 |---|---|
-| `stats` | Summary: uptime, client count, channel count, RX/TX bytes |
-| `channels` | Per-channel listing with subscriber nicks |
+| `stats` | Uptime, client/channel counts, RX/TX bytes, BBS summary |
+| `channels` | Active channels with subscriber nicks |
 | `clients` | Per-client table: nick, IP, channels, uptime, idle, packet counts |
-| `bbs` | List all BBS channels and message counts |
-| `bbs CHANNEL` | Show all stored messages for a specific channel |
+| `bbs [CHANNEL]` | BBS summary, or all messages for a specific channel |
 | `bbs-clear CHANNEL` | Delete all BBS messages for a channel |
+| `bbs-post CHANNEL TEXT` | Post a BBS message as `operator` (system channels allowed) |
 | `kick NICK` | Evict a client by callsign |
-| `ban IP` | Block an IP address (until restart or `unban`) |
+| `ban IP` | Block an IP address |
 | `unban IP` | Remove an IP ban |
-| `bans` | List all banned IPs |
-| `quit` | Graceful shutdown |
+| `bans` | List banned IPs |
+| `log [N]` | Last N lines from the daemon's in-memory log (default 100) |
+| `quiet [on\|off]` | Toggle per-packet console output |
+| `ping` | Check the daemon is alive |
+| `stop` | Graceful shutdown |
 
 ### Relay packet routing
 
@@ -564,7 +595,7 @@ Type these while the relay is running:
 | `ACK` (0x03) | Client-to-client only — dropped by relay |
 | `SCAN_REQ` (0x06) | Fan-out to channel + record `scan_id → requester addr` |
 | `SCAN_RSP` (0x07) | **Unicast back to original requester only** |
-| `BBS_POST` (0x12) | Store message in channel BBS; unicast confirmation to sender. **Rejected (error RSP)** if channel is a system channel |
+| `BBS_POST` (0x12) | Store message in BBS; unicast confirmation to sender. **Rejected** if channel is a system channel |
 | `BBS_REQ` (0x13) | Fetch stored BBS messages; unicast response to requester |
 | `BBS_RSP` (0x14) | **Unicast to requester only** — delivers stored message array |
 | `ACTIVE_REQ` (0x15) | **Unicast response** — relay returns snapshot of all channels with active subscribers |
@@ -577,27 +608,28 @@ Scan sessions expire after 60 seconds.
 
 The relay automatically creates three protected channels on startup:
 
-| Channel | Auto-joined on startup | Purpose |
+| Channel | Auto-joined by clients | Purpose |
 |---|---|---|
 | `#INFO` | ✅ yes | Relay announcements and operator information |
-| `#TEST` | ❌ no | Connection and audio testing — join manually with `#TEST` |
-| `#EMERGENCY` | ✅ yes | Urgent coordination — join here if you need immediate assistance |
+| `#TEST` | ❌ no | Connection and audio testing — join manually |
+| `#EMERGENCY` | ✅ yes | Urgent coordination |
 
-Each channel receives a seed BBS message from the relay itself when it is first created. Clients can join, send text and audio, and read the BBS on these channels normally. However, **BBS posts by clients are rejected** — the relay returns an error response and the client displays a warning. This keeps the BBS boards on system channels under operator control.
+Each channel receives a seed BBS message the first time it is created.
+On subsequent restarts, if the BBS file already has content for a system
+channel the seed is skipped — operator edits are never overwritten.
 
-Auto-join applies only in relay mode (`--relay HOST`). In LAN multicast mode the system channels are not joined automatically.
+Clients cannot post to system channels; the relay rejects those packets.
+The operator CLI is exempt: `bbs-post INFO` and `bbs-clear INFO` work
+without restriction.
 
-The seed message is posted only once per channel. After a relay restart, if the BBS file already contains messages for a system channel, no duplicate seed is added.
-
-The relay operator can manage system-channel BBS content from the console:
-
+```bash
+# Customise #INFO
+python3 geotalk-relay-cli.py bbs-clear INFO
+python3 geotalk-relay-cli.py bbs-post INFO PI4VNL relay — QRV 144.825 MHz
 ```
-bbs INFO                    # read current messages
-bbs-clear INFO              # wipe the board
-bbs INFO                    # (now empty — seed will NOT re-appear on next restart)
-```
 
-To repopulate a cleared system-channel BBS, delete the entry from the JSON file (or use `--bbs-file ''` to start fresh) and restart the relay.
+Auto-join applies only in relay mode (`--relay HOST`). In LAN multicast
+mode the system channels are not joined automatically.
 
 ---
 
@@ -651,7 +683,7 @@ All addresses fall in `239.73.0.0/16` — RFC 2365 organisation-local scope.
 | LAN | Any multicast-capable switch / AP (all consumer gear qualifies) |
 | Wi-Fi | Use `--local-if <IP>` to pin to wireless interface; relay mode recommended |
 | VPN mesh | WireGuard or OpenVPN `--dev tun` — multicast is forwarded |
-| Internet | Run `geotalk-relay.py` on a VPS; clients use `--relay` |
+| Internet | Run `geotalk-relayd.py` on a VPS; clients use `--relay` |
 
 Firewall — relay host:
 ```bash
@@ -722,6 +754,44 @@ Frequency channels behave exactly like postal-code channels:
 
 ---
 
+## WAV File Playback
+
+GeoTalk 2.1.0 adds `/play` — transmit a WAV file as voice audio on the active channel.
+
+```bash
+# Transmit a file
+/play /path/to/file.wav
+
+# Stop mid-file
+/play stop
+```
+
+**Accepted formats:**
+- Sample width: **16-bit PCM only** (8-bit, 24-bit and float WAVs are rejected)
+- Sample rate: **48 kHz only** — files at any other rate are rejected with a ready-to-paste `ffmpeg` conversion command
+- Channels: mono or stereo (stereo is downmixed to mono before encoding)
+
+The status line confirms the file is transmitting:
+
+```
+[PLAY] Transmitting beacon.wav  2.4s · opus
+[PLAY] Transmitting id.wav      1.0s · opus (stereo→mono)
+```
+
+Playback runs in a background thread so the REPL stays responsive. A second `/play` call while one is already in progress is rejected until the first finishes or `/play stop` is called.
+
+In the **GUI**, a green **▶ PLAY** button sits next to the mute button in the bottom bar. Clicking it opens a file-browser popup to select a WAV file. Once playing, the button changes to **■ STOP** — click again to abort. The status bar shows **▶ PLAYING** while a file is transmitting.
+
+**Preparing files with ffmpeg:**
+```bash
+# Convert any audio file to the required format (48 kHz, mono, 16-bit PCM)
+ffmpeg -i input.mp3 -ar 48000 -ac 1 -sample_fmt s16 output.wav
+ffmpeg -i input.flac -ar 48000 -ac 1 -sample_fmt s16 output.wav
+ffmpeg -i input.ogg  -ar 48000 -ac 1 -sample_fmt s16 output.wav
+```
+
+---
+
 ## Postal Code Formats
 
 | Country | Format | Exact | Wildcard |
@@ -756,12 +826,13 @@ Frequency channels behave exactly like postal-code channels:
 | TNC / APRS bridge | Encode messages as AX.25 UI frames for RF transmission |
 | Relay clustering | Multiple relay nodes sharing a channel registry over a message bus |
 | ~~BBS~~ | ✅ Built-in since v1.7.1 — persistent per-channel bulletin board on the relay |
-| ~~NL postcode DB~~ | ✅ Expanded in v2.0.0 — full per-district coverage 10xx–99xx (200+ entries), bare 4-digit lookups, corrected labels throughout |
+| ~~NL postcode DB~~ | ✅ Expanded in v2.1.0 — full per-district coverage 10xx–99xx (200+ entries), bare 4-digit lookups, corrected labels throughout |
 | ~~Country context~~ | ✅ Built-in since v1.8.1 — `/country CODE` filters region labels; auto-set by `--auto-channel` |
 | ~~Desktop GUI~~ | ✅ Built-in since v1.8.2 — `geotalk-gui.py` tkinter frontend with PTT, channel sidebar, saved settings |
 | ~~Active channel list~~ | ✅ Built-in since v1.9.0 — `/active` queries relay for all live channels with subscriber counts and nicks |
 | ~~Join-active startup~~ | ✅ Built-in since v1.9.0 — `--join-active` joins every live relay channel automatically on startup |
-| ~~Frequency channels~~ | ✅ Built-in since v2.0.0 — `#FREQ:145500` / `#FREQ:145.500` — kHz or MHz decimal, band name lookup, full relay+multicast support |
+| ~~WAV file playback~~ | ✅ Built-in since v2.1.0 — `/play file.wav` · 16-bit PCM, 48 kHz, mono or stereo, Opus-encoded, real-time paced |
+| ~~Frequency channels~~ | ✅ Built-in since v2.1.0 — `#FREQ:145500` / `#FREQ:145.500` — kHz or MHz decimal, band name lookup, full relay+multicast support |
 | ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY`; `#INFO` and `#EMERGENCY` auto-joined on startup, `#TEST` manual only; client BBS posts rejected |
 
 ---
