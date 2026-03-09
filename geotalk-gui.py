@@ -302,6 +302,7 @@ class GeoTalkGUI:
         self.gt: gt_mod.GeoTalk | None = None
         self._q: queue.Queue = queue.Queue()
         self._ptt_pressed = False  # mouse/keyboard hold state
+        self._ptt_release_id = None  # pending after() id for debounced key release
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -521,12 +522,26 @@ class GeoTalkGUI:
     def _ptt_key_down(self, event):
         if str(event.widget) == str(self._repl_entry):
             return   # don't intercept space in input box
+        # Cancel any pending debounced release — this KeyPress is auto-repeat,
+        # not a genuine new press after a release.
+        if self._ptt_release_id is not None:
+            self.root.after_cancel(self._ptt_release_id)
+            self._ptt_release_id = None
         if not self._ptt_pressed:
             self._ptt_down(None)
 
     def _ptt_key_up(self, event):
         if str(event.widget) == str(self._repl_entry):
             return
+        # On X11 key-repeat fires as KeyRelease+KeyPress pairs.
+        # Defer the actual release by 30 ms; if a KeyPress arrives before the
+        # timer fires we cancel it (handled in _ptt_key_down above).
+        if self._ptt_release_id is not None:
+            self.root.after_cancel(self._ptt_release_id)
+        self._ptt_release_id = self.root.after(30, self._ptt_key_release_commit)
+
+    def _ptt_key_release_commit(self):
+        self._ptt_release_id = None
         if self._ptt_pressed:
             self._ptt_up(None)
 
