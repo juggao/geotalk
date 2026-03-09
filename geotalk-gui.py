@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-gui.py — GeoTalk Desktop GUI  v1.9.2
+geotalk-gui.py — GeoTalk Desktop GUI  v2.1.0
 A tkinter frontend for the GeoTalk radio-over-IP client.
 
 Layout
@@ -25,7 +25,7 @@ import time
 import re
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import simpledialog, messagebox
+from tkinter import simpledialog, messagebox, filedialog
 
 # ── locate geotalk.py next to this script ─────────────────────────────────────
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -117,6 +117,9 @@ P = {
     "ptt_active": "#ff2020",      # PTT on
     "ptt_idle":   "#3a1010",      # PTT off (dark red)
     "scan":       "#20b8d0",      # scan / info colour
+    "play_idle":  "#0e2a18",      # PLAY button idle (dark green)
+    "play_active":"#20c040",      # PLAY button transmitting (bright green)
+    "play_dim":   "#1a6030",      # PLAY button border idle
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -303,6 +306,7 @@ class GeoTalkGUI:
         self._q: queue.Queue = queue.Queue()
         self._ptt_pressed = False  # mouse/keyboard hold state
         self._ptt_release_id = None  # pending after() id for debounced key release
+        self._play_busy = False       # True while WAV is being transmitted
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -476,6 +480,16 @@ class GeoTalkGUI:
             highlightthickness=1, highlightbackground=P["border"])
         self._mute_btn.pack(side="left", fill="y", padx=(0, 8), pady=12)
         self._mute_btn.configure(command=self._toggle_mute)
+
+        # PLAY button — browse for WAV file and transmit
+        self._play_btn = tk.Button(
+            bottom, text="▶ PLAY", font=("Courier", 10, "bold"),
+            bg=P["play_idle"], fg=P["green"],
+            activebackground=P["play_active"], activeforeground=P["bg"],
+            relief="flat", cursor="hand2",
+            highlightthickness=1, highlightbackground=P["play_dim"])
+        self._play_btn.pack(side="left", fill="y", padx=(0, 10), pady=12)
+        self._play_btn.configure(command=self._play_clicked)
 
         # Divider
         tk.Frame(bottom, bg=P["border"], width=1).pack(side="left", fill="y", pady=8)
@@ -749,6 +763,74 @@ class GeoTalkGUI:
                                      highlightbackground=P["border"])
         self._append_sys(strip_ansi(result or ""))
 
+    # ── WAV playback ──────────────────────────────────────────────────────────
+
+    def _play_clicked(self):
+        """Click handler for the PLAY button.
+        - If a file is already playing: stop it.
+        - Otherwise: open the file-browser popup and start playback.
+        """
+        if not self.gt:
+            self._append_sys("[PLAY] Not connected.")
+            return
+        if self._play_busy:
+            self._play_stop()
+        else:
+            self._play_browse()
+
+    def _play_browse(self):
+        """Open a file-browser popup, then transmit the selected WAV."""
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select WAV file to transmit",
+            filetypes=[
+                ("WAV audio", "*.wav *.WAV"),
+                ("All files",  "*.*"),
+            ],
+            initialdir=os.path.expanduser("~"),
+        )
+        if not path:
+            return   # user cancelled
+
+        result = self.gt.play_wav(path)
+        self._append_sys(strip_ansi(result))
+
+        # If playback started successfully, monitor the thread for completion
+        t = getattr(self.gt, "_play_thread", None)
+        if t and t.is_alive():
+            self._play_set_busy(True)
+            self._play_watch()
+
+    def _play_stop(self):
+        """Stop an in-progress playback."""
+        if not self.gt:
+            return
+        result = self.gt.play_stop()
+        self._append_sys(strip_ansi(result))
+        self._play_set_busy(False)
+
+    def _play_set_busy(self, busy: bool):
+        """Update button appearance to reflect playing / idle state."""
+        self._play_busy = busy
+        if busy:
+            self._play_btn.configure(
+                text="■ STOP",
+                bg=P["play_active"], fg=P["bg"],
+                highlightbackground=P["play_active"])
+        else:
+            self._play_btn.configure(
+                text="▶ PLAY",
+                bg=P["play_idle"], fg=P["green"],
+                highlightbackground=P["play_dim"])
+
+    def _play_watch(self):
+        """Poll every 200 ms; reset button when the play thread finishes."""
+        t = getattr(self.gt, "_play_thread", None) if self.gt else None
+        if t and t.is_alive():
+            self.root.after(200, self._play_watch)
+        else:
+            self._play_set_busy(False)
+
     # ── REPL ──────────────────────────────────────────────────────────────────
 
     def _on_repl_enter(self, event):
@@ -1004,6 +1086,10 @@ class GeoTalkGUI:
                 flags.append(ptt)
             if mute_str:
                 flags.append(mute_str)
+            # Playing indicator
+            play_thread = getattr(self.gt, "_play_thread", None)
+            if play_thread and play_thread.is_alive():
+                flags.append("▶ PLAYING")
             flags.append(f"country: {self.gt._current_country}")
             n_ch = len(self.gt.channels)
             if n_ch:
