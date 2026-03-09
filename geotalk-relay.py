@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.9.0
+geotalk-relay.py — GeoTalk Relay / Bridge Server  v2.0.0
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Bridges GeoTalk UDP traffic across subnets and the internet.
@@ -87,7 +87,7 @@ from collections import defaultdict
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "1.9.2"
+VERSION  = "2.0.0"
 MAGIC    = b"GT"
 BUF_SIZE = 65536   # large enough for any codec frame (Opus ~80 B, PCM ~4 KB)
 

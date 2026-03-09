@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.9.4**
+**Version 2.0.0**
 
 ---
 
@@ -18,6 +18,7 @@ via a relay server.
 | 📮 | Exact postal channels | Any EU/UK postal code is a channel — `#59601`, `#1234AB`, `#SW1A` |
 | 🔍 | Wildcard channels | `#59**` = Venlo region · `#750**` = Paris · `#1***??` = Amsterdam |
 | 🧩 | Regex channels | `/^[0-9]{4}[A-Z]{2}$/` — full Python regex between `//` |
+| 📻 | Frequency channels | `#FREQ:145500` or `#FREQ:145.500` — join a virtual channel by MHz/kHz frequency; band name shown in sidebar |
 | 🗺️ | Region database | 200+ NL postal prefixes (per-district, 10xx–99xx) + DE/FR/BE/GB/ES/IT/PT/CH/AT/DK/SE/NO |
 | 💬 | Text messaging | Instant broadcast to all channel members |
 | 🎙️ | Push-to-Talk (PTT) | Real mic audio over UDP — **Opus codec** (32 kbit/s) when `opuslib` installed, raw PCM fallback |
@@ -164,7 +165,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.9.4 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.0.0 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
@@ -664,6 +665,63 @@ sudo ufw allow 5073:5326/udp
 
 ---
 
+## Frequency Channels
+
+GeoTalk 2.0.0 adds a new channel type keyed by radio frequency rather than postal code.
+Any number of MHz or kHz can be used — the frequency is normalised to integer kHz internally
+and mapped to a stable multicast address and relay key.
+
+```bash
+# Join the 2-metre amateur calling frequency
+python3 geotalk.py --nick PA3XYZ --relay relay.example.com --join FREQ:145500
+
+# MHz decimal notation — identical result
+python3 geotalk.py --nick PA3XYZ --relay relay.example.com --join FREQ:145.500
+
+# Aviation VHF ground control (kHz)
+#FREQ:121500
+
+# Marine channel 16 distress frequency
+#FREQ:156800
+```
+
+Frequency channels behave exactly like postal-code channels:
+- Full relay and LAN multicast support
+- PTT voice, text messaging, BBS, `/scan`, `/active` all work
+- The sidebar and `/ch` show the band name (e.g. `2 m amateur`, `Aviation VHF comm`, `Marine VHF`)
+- Packets are matched by exact frequency key — no postal-code cross-matching
+
+**Input formats accepted:**
+
+| Input | Interpreted as | Key stored |
+|---|---|---|
+| `FREQ:145500` | 145500 kHz | `FREQ:145500` |
+| `FREQ:145.500` | 145.500 MHz → 145500 kHz | `FREQ:145500` |
+| `FREQ:7100` | 7100 kHz (7.1 MHz) | `FREQ:7100` |
+| `FREQ:144` | 144 kHz (VLF) | `FREQ:144` |
+
+**Known bands** (outside these ranges a generic HF/VHF/UHF label is shown):
+
+| Range | Label |
+|---|---|
+| 1.810–2.000 MHz | 160 m amateur |
+| 3.500–3.800 MHz | 80 m amateur |
+| 7.000–7.300 MHz | 40 m amateur |
+| 14.000–14.350 MHz | 20 m amateur |
+| 21.000–21.450 MHz | 15 m amateur |
+| 28.000–29.700 MHz | 10 m amateur |
+| 50.000–52.000 MHz | 6 m amateur |
+| 108–118 MHz | Aviation ILS / VOR / nav |
+| 118–136.975 MHz | Aviation VHF comm |
+| 144–146 MHz | 2 m amateur |
+| 146–156 MHz | VHF high band |
+| 156–174 MHz | Marine VHF |
+| 430–440 MHz | 70 cm amateur |
+| 462–468 MHz | PMR446 / FRS |
+| 1240–1300 MHz | 23 cm amateur |
+
+---
+
 ## Postal Code Formats
 
 | Country | Format | Exact | Wildcard |
@@ -681,6 +739,8 @@ sudo ufw allow 5073:5326/udp
 | Denmark | `2100` | `#2100` | `#2***` |
 | Sweden | `11321` | `#11321` | `#1**` |
 | Norway | `0150` | `#0150` | `#01**` |
+| Frequency | kHz integer | `#FREQ:145500` | — |
+| Frequency | MHz decimal | `#FREQ:145.500` | — |
 
 ---
 
@@ -696,11 +756,12 @@ sudo ufw allow 5073:5326/udp
 | TNC / APRS bridge | Encode messages as AX.25 UI frames for RF transmission |
 | Relay clustering | Multiple relay nodes sharing a channel registry over a message bus |
 | ~~BBS~~ | ✅ Built-in since v1.7.1 — persistent per-channel bulletin board on the relay |
-| ~~NL postcode DB~~ | ✅ Expanded in v1.9.4 — full per-district coverage 10xx–99xx (200+ entries), bare 4-digit lookups, corrected labels throughout |
+| ~~NL postcode DB~~ | ✅ Expanded in v2.0.0 — full per-district coverage 10xx–99xx (200+ entries), bare 4-digit lookups, corrected labels throughout |
 | ~~Country context~~ | ✅ Built-in since v1.8.1 — `/country CODE` filters region labels; auto-set by `--auto-channel` |
 | ~~Desktop GUI~~ | ✅ Built-in since v1.8.2 — `geotalk-gui.py` tkinter frontend with PTT, channel sidebar, saved settings |
 | ~~Active channel list~~ | ✅ Built-in since v1.9.0 — `/active` queries relay for all live channels with subscriber counts and nicks |
 | ~~Join-active startup~~ | ✅ Built-in since v1.9.0 — `--join-active` joins every live relay channel automatically on startup |
+| ~~Frequency channels~~ | ✅ Built-in since v2.0.0 — `#FREQ:145500` / `#FREQ:145.500` — kHz or MHz decimal, band name lookup, full relay+multicast support |
 | ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY`; `#INFO` and `#EMERGENCY` auto-joined on startup, `#TEST` manual only; client BBS posts rejected |
 
 ---

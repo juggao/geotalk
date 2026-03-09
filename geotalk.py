@@ -8,7 +8,7 @@ Author: René Oudeweg / Claude
 
 Channel syntax
   Exact:    #5911AB  #59601  #75001
-  Wildcard: #59**    #5***   #75***  (glob-style, * = any digit/char)
+  Wildcard: #59**    #5***   #75***  (glob-style: * = one digit, ** = two digits, *** = three digits, ? = one letter)
   Regex:    #/^59[0-9]{3}$/  (full Python regex between //)
 """
 
@@ -47,7 +47,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "1.9.2"
+VERSION      = "2.0.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -103,79 +103,241 @@ KNOWN_COUNTRIES: set[str] = {
 
 _GEO_REGIONS: list[tuple[str, str, str]] = [
     # ── Netherlands ──────────────────────────────────────────────────────────
-    ("1***??", "NL", "Amsterdam"),
-    ("2***??", "NL", "South Holland / The Hague area"),
-    ("3***??", "NL", "Utrecht / South Holland"),
-    ("40**??", "NL", "Arnhem"),
-    ("41**??", "NL", "Arnhem"),
-    ("42**??", "NL", "Arnhem / Nijmegen"),
-    ("43**??", "NL", "Arnhem / Doetinchem"),
-    ("44**??", "NL", "Arnhem"),
-    ("45**??", "NL", "Arnhem"),
-    ("46**??", "NL", "Arnhem / Nijmegen"),
-    ("47**??", "NL", "Nijmegen"),
-    ("48**??", "NL", "Nijmegen"),
-    ("49**??", "NL", "Nijmegen"),
-    ("50**??", "NL", "Nijmegen / Gennep"),
-    ("51**??", "NL", "Boxmeer / Cuijk"),
+    # NL postcodes are ddddLL (4 digits + 2 letters).
+    # Each range has three entries so all input forms resolve correctly:
+    #   dd**??  — full postcode  (e.g. 5912AB)
+    #   dd**    — 4-digit bare   (e.g. 5912)
+    # Broad 1-digit entries cover patterns like #1000, #2000, #3000.
+    # Venlo sub-districts also have 3-digit entries (590*, 591*, …).
+
+    # Noord-Holland
+    ("10**??", "NL", "Amsterdam Centrum"),
+    ("10**",   "NL", "Amsterdam Centrum"),
+    ("11**??", "NL", "Amsterdam Noord / Oost"),
+    ("11**",   "NL", "Amsterdam Noord / Oost"),
+    ("12**??", "NL", "Amsterdam Oost / Zuidoost"),
+    ("12**",   "NL", "Amsterdam Oost / Zuidoost"),
+    ("13**??", "NL", "Amsterdam West"),
+    ("13**",   "NL", "Amsterdam West"),
+    ("14**??", "NL", "Amsterdam Nieuw-West"),
+    ("14**",   "NL", "Amsterdam Nieuw-West"),
+    ("15**??", "NL", "Amsterdam Zuidoost / Diemen"),
+    ("15**",   "NL", "Amsterdam Zuidoost / Diemen"),
+    ("16**??", "NL", "Amsterdam / Waterland"),
+    ("16**",   "NL", "Amsterdam / Waterland"),
+    ("17**??", "NL", "Zaandam / Purmerend"),
+    ("17**",   "NL", "Zaandam / Purmerend"),
+    ("18**??", "NL", "Alkmaar"),
+    ("18**",   "NL", "Alkmaar"),
+    ("19**??", "NL", "Alkmaar / Den Helder"),
+    ("19**",   "NL", "Alkmaar / Den Helder"),
+    ("1***??", "NL", "Amsterdam regio"),      # catch-all for 1xxx full codes
+    ("1***",   "NL", "Amsterdam regio"),      # catch-all for bare 1xxx
+
+    # Zuid-Holland (north / Den Haag)
+    ("20**??", "NL", "Den Haag Centrum"),
+    ("20**",   "NL", "Den Haag Centrum"),
+    ("21**??", "NL", "Den Haag"),
+    ("21**",   "NL", "Den Haag"),
+    ("22**??", "NL", "Den Haag Zuid / Rijswijk"),
+    ("22**",   "NL", "Den Haag Zuid / Rijswijk"),
+    ("23**??", "NL", "Delft"),
+    ("23**",   "NL", "Delft"),
+    ("24**??", "NL", "Delft / Zoetermeer"),
+    ("24**",   "NL", "Delft / Zoetermeer"),
+    ("25**??", "NL", "Den Haag / Leiden"),
+    ("25**",   "NL", "Den Haag / Leiden"),
+    ("26**??", "NL", "Leiden / Alphen aan den Rijn"),
+    ("26**",   "NL", "Leiden / Alphen aan den Rijn"),
+    ("27**??", "NL", "Gouda / Alphen aan den Rijn"),
+    ("27**",   "NL", "Gouda / Alphen aan den Rijn"),
+    ("28**??", "NL", "Rotterdam Noord"),
+    ("28**",   "NL", "Rotterdam Noord"),
+    ("29**??", "NL", "Rotterdam / Schiedam / Vlaardingen"),
+    ("29**",   "NL", "Rotterdam / Schiedam / Vlaardingen"),
+    ("2***??", "NL", "Zuid-Holland"),          # catch-all
+    ("2***",   "NL", "Zuid-Holland"),
+
+    # Utrecht / Flevoland
+    ("30**??", "NL", "Utrecht Centrum"),
+    ("30**",   "NL", "Utrecht Centrum"),
+    ("31**??", "NL", "Utrecht / Zeist"),
+    ("31**",   "NL", "Utrecht / Zeist"),
+    ("32**??", "NL", "Utrecht / Nieuwegein"),
+    ("32**",   "NL", "Utrecht / Nieuwegein"),
+    ("33**??", "NL", "Utrecht / Woerden"),
+    ("33**",   "NL", "Utrecht / Woerden"),
+    ("34**??", "NL", "Woerden / Gouda"),
+    ("34**",   "NL", "Woerden / Gouda"),
+    ("35**??", "NL", "Utrecht / Amersfoort / Soest"),
+    ("35**",   "NL", "Utrecht / Amersfoort / Soest"),
+    ("36**??", "NL", "Almere"),
+    ("36**",   "NL", "Almere"),
+    ("37**??", "NL", "Lelystad"),
+    ("37**",   "NL", "Lelystad"),
+    ("38**??", "NL", "Harderwijk / Lelystad"),
+    ("38**",   "NL", "Harderwijk / Lelystad"),
+    ("39**??", "NL", "Wageningen / Ede"),
+    ("39**",   "NL", "Wageningen / Ede"),
+    ("3***??", "NL", "Utrecht regio"),         # catch-all
+    ("3***",   "NL", "Utrecht regio"),
+
+    # Gelderland (Arnhem / Nijmegen)
+    ("40**??", "NL", "Arnhem Noord"),
+    ("40**",   "NL", "Arnhem Noord"),
+    ("41**??", "NL", "Arnhem Centrum"),
+    ("41**",   "NL", "Arnhem Centrum"),
+    ("42**??", "NL", "Arnhem / Duiven / Westervoort"),
+    ("42**",   "NL", "Arnhem / Duiven / Westervoort"),
+    ("43**??", "NL", "Doetinchem"),
+    ("43**",   "NL", "Doetinchem"),
+    ("44**??", "NL", "Doetinchem / Aalten"),
+    ("44**",   "NL", "Doetinchem / Aalten"),
+    ("45**??", "NL", "Nijmegen West"),
+    ("45**",   "NL", "Nijmegen West"),
+    ("46**??", "NL", "Nijmegen Centrum / Oost"),
+    ("46**",   "NL", "Nijmegen Centrum / Oost"),
+    ("47**??", "NL", "Nijmegen / Beuningen"),
+    ("47**",   "NL", "Nijmegen / Beuningen"),
+    ("48**??", "NL", "Nijmegen / Wijchen"),
+    ("48**",   "NL", "Nijmegen / Wijchen"),
+    ("49**??", "NL", "Cuijk / Land van Cuijk"),
+    ("49**",   "NL", "Cuijk / Land van Cuijk"),
+
+    # Noord-Brabant
+    ("50**??", "NL", "Oss / Veghel"),
+    ("50**",   "NL", "Oss / Veghel"),
+    ("51**??", "NL", "Veghel / Uden"),
+    ("51**",   "NL", "Veghel / Uden"),
     ("52**??", "NL", "Helmond"),
-    ("53**??", "NL", "Helmond / Eindhoven"),
-    ("54**??", "NL", "Den Bosch"),
-    ("55**??", "NL", "Den Bosch"),
-    ("56**??", "NL", "Eindhoven"),
-    ("57**??", "NL", "Eindhoven"),
+    ("52**",   "NL", "Helmond"),
+    ("53**??", "NL", "Helmond / Deurne"),
+    ("53**",   "NL", "Helmond / Deurne"),
+    ("54**??", "NL", "'s-Hertogenbosch Centrum"),
+    ("54**",   "NL", "'s-Hertogenbosch Centrum"),
+    ("55**??", "NL", "'s-Hertogenbosch Oost"),
+    ("55**",   "NL", "'s-Hertogenbosch Oost"),
+    ("56**??", "NL", "Eindhoven Noord"),
+    ("56**",   "NL", "Eindhoven Noord"),
+    ("57**??", "NL", "Eindhoven Centrum / Zuid"),
+    ("57**",   "NL", "Eindhoven Centrum / Zuid"),
     ("58**??", "NL", "Eindhoven / Weert"),
+    ("58**",   "NL", "Eindhoven / Weert"),
+
+    # Limburg — Venlo sub-districts (3-digit prefix entries)
     ("590*??", "NL", "Venlo Noord"),
+    ("590*",   "NL", "Venlo Noord"),
     ("591*??", "NL", "Venlo Centrum"),
+    ("591*",   "NL", "Venlo Centrum"),
     ("592*??", "NL", "Venlo Zuid"),
+    ("592*",   "NL", "Venlo Zuid"),
     ("593*??", "NL", "Venlo / Blerick"),
+    ("593*",   "NL", "Venlo / Blerick"),
     ("594*??", "NL", "Tegelen"),
+    ("594*",   "NL", "Tegelen"),
     ("595*??", "NL", "Arcen / Bergen (L)"),
+    ("595*",   "NL", "Arcen / Bergen (L)"),
     ("596*??", "NL", "Venlo / Horst"),
+    ("596*",   "NL", "Venlo / Horst"),
     ("597*??", "NL", "Horst aan de Maas"),
+    ("597*",   "NL", "Horst aan de Maas"),
     ("598*??", "NL", "Venray"),
+    ("598*",   "NL", "Venray"),
     ("599*??", "NL", "Bergen / Gennep"),
-    ("59****", "NL", "Venlo regio"),          # catch-all for #59**
+    ("599*",   "NL", "Bergen / Gennep"),
+    ("59**",   "NL", "Venlo regio"),
+
+    # Limburg — rest
     ("60**??", "NL", "Weert"),
+    ("60**",   "NL", "Weert"),
     ("61**??", "NL", "Roermond"),
+    ("61**",   "NL", "Roermond"),
     ("62**??", "NL", "Maastricht"),
-    ("63**??", "NL", "Maastricht / Sittard"),
+    ("62**",   "NL", "Maastricht"),
+    ("63**??", "NL", "Sittard-Geleen"),
+    ("63**",   "NL", "Sittard-Geleen"),
     ("64**??", "NL", "Heerlen"),
+    ("64**",   "NL", "Heerlen"),
     ("65**??", "NL", "Heerlen / Kerkrade"),
-    ("66**??", "NL", "Venlo / Tegelen"),
-    ("67**??", "NL", "Roermond"),
-    ("68**??", "NL", "Echt-Susteren"),
-    ("69**??", "NL", "Sittard-Geleen"),
-    ("70**??", "NL", "Den Haag"),
+    ("65**",   "NL", "Heerlen / Kerkrade"),
+    ("66**??", "NL", "Venlo / Venray"),
+    ("66**",   "NL", "Venlo / Venray"),
+    ("67**??", "NL", "Roermond / Echt-Susteren"),
+    ("67**",   "NL", "Roermond / Echt-Susteren"),
+    ("68**??", "NL", "Echt-Susteren / Sittard"),
+    ("68**",   "NL", "Echt-Susteren / Sittard"),
+    ("69**??", "NL", "Sittard-Geleen / Maastricht"),
+    ("69**",   "NL", "Sittard-Geleen / Maastricht"),
+
+    # Zuid-Holland (south / Rotterdam)
+    ("70**??", "NL", "Den Haag Centrum"),
+    ("70**",   "NL", "Den Haag Centrum"),
     ("71**??", "NL", "Delft / Den Haag"),
+    ("71**",   "NL", "Delft / Den Haag"),
     ("72**??", "NL", "Leiden"),
+    ("72**",   "NL", "Leiden"),
     ("73**??", "NL", "Dordrecht"),
-    ("74**??", "NL", "Dordrecht / Gorinchem"),
-    ("75**??", "NL", "Rotterdam"),
-    ("76**??", "NL", "Rotterdam"),
+    ("73**",   "NL", "Dordrecht"),
+    ("74**??", "NL", "Gorinchem / Dordrecht"),
+    ("74**",   "NL", "Gorinchem / Dordrecht"),
+    ("75**??", "NL", "Rotterdam Centrum / Noord"),
+    ("75**",   "NL", "Rotterdam Centrum / Noord"),
+    ("76**??", "NL", "Rotterdam Zuid / Capelle / Ridderkerk"),
+    ("76**",   "NL", "Rotterdam Zuid / Capelle / Ridderkerk"),
+
+    # Noord-Brabant (west)
     ("77**??", "NL", "Breda"),
-    ("78**??", "NL", "Breda / Tilburg"),
+    ("77**",   "NL", "Breda"),
+    ("78**??", "NL", "Bergen op Zoom / Roosendaal"),
+    ("78**",   "NL", "Bergen op Zoom / Roosendaal"),
     ("79**??", "NL", "Tilburg / Waalwijk"),
-    ("80**??", "NL", "Utrecht"),
-    ("81**??", "NL", "Utrecht"),
+    ("79**",   "NL", "Tilburg / Waalwijk"),
+
+    # Utrecht / Gelderland (east)
+    ("80**??", "NL", "Utrecht Centrum"),
+    ("80**",   "NL", "Utrecht Centrum"),
+    ("81**??", "NL", "Utrecht Oost / Nieuwegein"),
+    ("81**",   "NL", "Utrecht Oost / Nieuwegein"),
     ("82**??", "NL", "Amersfoort"),
-    ("83**??", "NL", "Amersfoort"),
-    ("84**??", "NL", "Amersfoort / Veenendaal"),
-    ("85**??", "NL", "Veenendaal / Wageningen"),
-    ("86**??", "NL", "Wageningen / Ede"),
+    ("82**",   "NL", "Amersfoort"),
+    ("83**??", "NL", "Amersfoort / Leusden / Barneveld"),
+    ("83**",   "NL", "Amersfoort / Leusden / Barneveld"),
+    ("84**??", "NL", "Ede / Veenendaal"),
+    ("84**",   "NL", "Ede / Veenendaal"),
+    ("85**??", "NL", "Wageningen / Rhenen"),
+    ("85**",   "NL", "Wageningen / Rhenen"),
+    ("86**??", "NL", "Arnhem / Duiven / Zevenaar"),
+    ("86**",   "NL", "Arnhem / Duiven / Zevenaar"),
     ("87**??", "NL", "Apeldoorn"),
-    ("88**??", "NL", "Apeldoorn"),
-    ("89**??", "NL", "Apeldoorn / Zutphen"),
-    ("90**??", "NL", "Deventer"),
-    ("91**??", "NL", "Deventer / Almelo"),
-    ("92**??", "NL", "Almelo / Enschede"),
-    ("93**??", "NL", "Enschede"),
-    ("94**??", "NL", "Hengelo"),
-    ("95**??", "NL", "Hengelo / Borne"),
+    ("87**",   "NL", "Apeldoorn"),
+    ("88**??", "NL", "Apeldoorn / Deventer"),
+    ("88**",   "NL", "Apeldoorn / Deventer"),
+    ("89**??", "NL", "Zutphen / Doetinchem"),
+    ("89**",   "NL", "Zutphen / Doetinchem"),
+
+    # Overijssel
+    ("90**??", "NL", "Deventer / Olst"),
+    ("90**",   "NL", "Deventer / Olst"),
+    ("91**??", "NL", "Almelo / Borne"),
+    ("91**",   "NL", "Almelo / Borne"),
+    ("92**??", "NL", "Enschede"),
+    ("92**",   "NL", "Enschede"),
+    ("93**??", "NL", "Enschede / Hengelo"),
+    ("93**",   "NL", "Enschede / Hengelo"),
+    ("94**??", "NL", "Hengelo / Borne"),
+    ("94**",   "NL", "Hengelo / Borne"),
+    ("95**??", "NL", "Almelo / Borne"),
+    ("95**",   "NL", "Almelo / Borne"),
     ("96**??", "NL", "Zwolle"),
-    ("97**??", "NL", "Zwolle / Meppel"),
-    ("98**??", "NL", "Groningen"),
-    ("99**??", "NL", "Groningen"),
+    ("96**",   "NL", "Zwolle"),
+
+    # Drenthe / Groningen
+    ("97**??", "NL", "Groningen / Meppel / Assen"),
+    ("97**",   "NL", "Groningen / Meppel / Assen"),
+    ("98**??", "NL", "Assen / Groningen"),
+    ("98**",   "NL", "Assen / Groningen"),
+    ("99**??", "NL", "Groningen / NE Groningen"),
+    ("99**",   "NL", "Groningen / NE Groningen"),
 
     # ── Germany (5-digit) ─────────────────────────────────────────────────
     ("596**", "DE", "Mülheim/Ruhr"),
@@ -372,47 +534,41 @@ def _glob_to_regex(pattern: str) -> str:
     Wildcard semantics
     ──────────────────
       *   → exactly one digit          [0-9]
-      **  → one or more any non-space  [^\\s]+   (general multi-char wildcard)
+      **  → exactly two digits         [0-9]{2}
       *** → exactly three digits       [0-9]{3}
-      **** or more → one-or-more any   [^\\s]+   (catch-all)
       ?   → exactly one letter         [A-Za-z]
+      ??  → exactly two letters        [A-Za-z]{2}
 
-    Runs of * are counted before dispatching so that `***` is not
-    mis-parsed as `**` + `*`.
+    Runs of identical wildcards are counted and dispatched as a unit.
+    Each extra * beyond three adds one more digit: **** = [0-9]{4}, etc.
 
     Examples
     ────────
       NL  3***??   →  3 + [0-9]{3} + [A-Za-z]{2}   matches 3402AB
       NL  590*??   →  590 + [0-9] + [A-Za-z]{2}    matches 5901AB
-      NL  40**??   →  40 + [0-9]+ + [A-Za-z]{2}    matches 4012AB
+      NL  59**??   →  59 + [0-9]{2} + [A-Za-z]{2}  matches 5912AB
       DE  40***    →  40 + [0-9]{3}                 matches 40115
-      FR  750**    →  750 + [0-9]+                  matches 75001
-      GB  G**      →  G + [^\\s]+                    matches G1, G12
-      NL  59****   →  59 + [^\\s]+                   catch-all
+      FR  750**    →  750 + [0-9]{2}                matches 75001
+      NL  59**     →  59 + [0-9]{2}                 matches 5900-5999
     """
     escaped = ""
     i = 0
     while i < len(pattern):
         ch = pattern[i]
         if ch == "*":
-            # Count the full run of consecutive *
             j = i
             while j < len(pattern) and pattern[j] == "*":
                 j += 1
             run = j - i
             i = j
-            if run == 1:
-                escaped += "[0-9]"
-            elif run == 2:
-                escaped += "[^\\s]+"
-            elif run == 3:
-                escaped += "[0-9]{3}"
-            else:
-                # 4+ stars: general catch-all
-                escaped += "[^\\s]+"
+            escaped += f"[0-9]{{{run}}}"
         elif ch == "?":
-            escaped += "[A-Za-z]"
-            i += 1
+            j = i
+            while j < len(pattern) and pattern[j] == "?":
+                j += 1
+            run = j - i
+            i = j
+            escaped += f"[A-Za-z]{{{run}}}"
         else:
             escaped += re.escape(ch)
             i += 1
@@ -431,13 +587,36 @@ class ChannelPattern:
       • exact  — a specific postal code   e.g. 5911AB
       • glob   — wildcard pattern          e.g. 59**
       • regex  — Python regex              e.g. /^59[0-9]{3}$/
+      • freq   — radio frequency channel   e.g. FREQ:135500  (kHz integer)
     """
 
     def __init__(self, raw: str):
         raw = raw.strip().upper().replace(" ", "")
         self.raw = raw
 
-        if raw.startswith("/") and raw.endswith("/") and len(raw) > 2:
+        if raw.startswith("FREQ:"):
+            # ── frequency channel ─────────────────────────────────────────
+            self.kind = "freq"
+            freq_str  = raw[5:].replace(".", "").replace(",", "")
+            # Accept either kHz integers (135500) or MHz with decimals (135.500)
+            # Normalise to integer kHz
+            orig = raw[5:]
+            try:
+                if "." in orig or "," in orig:
+                    # MHz input — convert to kHz
+                    mhz = float(orig.replace(",", "."))
+                    khz = int(round(mhz * 1000))
+                else:
+                    khz = int(orig)
+                if khz <= 0:
+                    raise ValueError("frequency must be positive")
+            except ValueError as e:
+                raise ValueError(f"Invalid frequency: {orig!r} — {e}")
+            self.source = str(khz)          # canonical kHz string
+            self.key    = f"FREQ:{khz}"
+            self._re    = re.compile(f"^FREQ:{re.escape(str(khz))}$", re.IGNORECASE)
+
+        elif raw.startswith("/") and raw.endswith("/") and len(raw) > 2:
             # ── explicit regex ────────────────────────────────────────────
             self.kind   = "regex"
             self.source = raw[1:-1]
@@ -472,11 +651,19 @@ class ChannelPattern:
     def display(self) -> str:
         if self.kind == "regex":
             return f"/{self.source}/"
+        if self.kind == "freq":
+            khz = int(self.source)
+            if khz % 1000 == 0:
+                return f"FREQ:{khz // 1000} MHz"
+            # Always show 3 decimal places so 145500 → 145.500, not 145.5
+            return f"FREQ:{khz / 1000:.3f} MHz"
         return self.source
 
     def region_info(self, cc: str = "") -> str:
         """Return human-readable region name(s) matching this pattern.
         If cc is given, prefer matches for that country."""
+        if self.kind == "freq":
+            return _freq_band_name(int(self.source))
         if self.kind == "exact":
             return _lookup_region(self.source, cc)
         # For wildcards, list all DB entries that overlap
@@ -495,6 +682,47 @@ class ChannelPattern:
 
     def __repr__(self):
         return f"ChannelPattern({self.kind}, {self.source!r})"
+
+
+def _freq_band_name(khz: int) -> str:
+    """Return a human-readable band/service description for a frequency in kHz."""
+    mhz = khz / 1000.0
+    bands = [
+        # (lo_MHz, hi_MHz, label)
+        (0.1485,   0.2835,  "LW broadcast"),
+        (0.5260,   1.6065,  "MW broadcast"),
+        (1.810,    2.000,   "160 m amateur"),
+        (3.500,    3.800,   "80 m amateur"),
+        (5.3515,   5.3665,  "60 m amateur"),
+        (7.000,    7.300,   "40 m amateur"),
+        (10.100,   10.150,  "30 m amateur"),
+        (14.000,   14.350,  "20 m amateur"),
+        (18.068,   18.168,  "17 m amateur"),
+        (21.000,   21.450,  "15 m amateur"),
+        (24.890,   24.990,  "12 m amateur"),
+        (28.000,   29.700,  "10 m amateur"),
+        (50.000,   52.000,  "6 m amateur"),
+        (108.000,  118.000, "Aviation ILS / VOR / nav"),
+        (118.000,  136.975, "Aviation VHF comm"),
+        (144.000,  146.000, "2 m amateur"),
+        (146.000,  156.000, "VHF high band"),
+        (156.000,  174.000, "Marine VHF"),
+        (430.000,  440.000, "70 cm amateur"),
+        (462.000,  468.000, "PMR446 / FRS"),
+        (1240.000, 1300.000,"23 cm amateur"),
+    ]
+    for lo, hi, label in bands:
+        if lo <= mhz <= hi:
+            return label
+    if mhz < 0.1:
+        return "VLF"
+    if mhz < 30:
+        return "HF"
+    if mhz < 300:
+        return "VHF"
+    if mhz < 3000:
+        return "UHF"
+    return "SHF/EHF"
 
 
 def _lookup_region(postal: str, cc: str = "") -> str:
@@ -551,7 +779,7 @@ def postal_to_multicast(key: str) -> str:
     """
     raw = _canonical_key(key).strip().upper().replace(" ", "")
 
-    if not (raw.startswith("REGEX:") or "*" in raw or "?" in raw):
+    if not (raw.startswith("REGEX:") or raw.startswith("FREQ:") or "*" in raw or "?" in raw):
         # Exact postal: use prefix for geographic clustering
         prefix = raw[:4]
         h1 = int(hashlib.md5(prefix.encode()).hexdigest(), 16) % 254 + 1
@@ -575,9 +803,11 @@ def parse_channel(raw: str) -> ChannelPattern:
     """
     Parse a user-supplied channel string into a ChannelPattern.
     Accepts:
-      59**         glob wildcard
-      /^59\\d{3}$/ regex (between slashes)
-      5911AB       exact
+      59**           glob wildcard
+      /^59\\d{3}$/   regex (between slashes)
+      5911AB         exact postal code
+      FREQ:135500    frequency channel (kHz integer)
+      FREQ:145.500   frequency channel (MHz decimal → converted to kHz)
     """
     return ChannelPattern(raw)
 
@@ -588,6 +818,9 @@ def expand_wildcard_info(pattern: ChannelPattern, cc: str = "") -> str:
     known sub-regions that fall within the pattern.
     If cc is given, prefer entries for that country (show others dimmed).
     """
+    if pattern.kind == "freq":
+        band = _freq_band_name(int(pattern.source))
+        return f"  Band: {band}"
     if not pattern.is_wildcard():
         region = _lookup_region(pattern.key, cc)
         return f"  Region: {region}"
@@ -1311,8 +1544,7 @@ class Channel:
     def summary(self, cc: str = "") -> str:
         users  = self.active_users()
         up     = int(time.time() - self.joined_at)
-        region = _lookup_region(self.pattern.source, cc) if self.pattern.kind == "exact" \
-                 else self.pattern.region_info(cc)
+        region = self.pattern.region_info(cc)
         return (f"{B}{CY}#{self.pattern.display()}{R}  "
                 f"{DM}{region}{R}  "
                 f"mcast={self.multicast}:{self.port}  "
@@ -1348,31 +1580,32 @@ SCAN_BATCH_SIZE = 16
 
 
 # Characters used to enumerate wildcard positions.
-# Single * = exactly one char from this set; ** = 1-or-more chars.
-_SCAN_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# * = one digit, ** = two digits, *** = three digits, ? = one letter.
+_SCAN_DIGITS = "0123456789"
+_SCAN_ALPHA  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_SCAN_CHARS  = _SCAN_DIGITS + _SCAN_ALPHA   # kept for callers that reference it
 
 
 def _enumerate_glob(pattern: ChannelPattern,
                     max_codes: int = SCAN_MAX_CANDIDATES) -> list[str]:
     """
     Enumerate concrete codes that match a glob pattern by expanding each
-    wildcard position over _SCAN_CHARS.
+    wildcard position.
 
-    Rules
-    ─────
-    *   → exactly one character from _SCAN_CHARS
-    **  → one or two characters (we limit expansion depth to keep it bounded)
-    ?   → treated like * (one char)
+    Rules (corrected semantics)
+    ─────────────────────────────
+    *   → exactly one digit  [0-9]
+    **  → exactly two digits [0-9]{2}   (i.e. 00..99)
+    *** → exactly three digits          (i.e. 000..999)
+    ?   → exactly one letter [A-Z]
+    ??  → exactly two letters [A-Z]{2}
 
-    Only codes longer than the fixed prefix are yielded.  Expansion stops
-    once max_codes is reached so a broad pattern like #** does not explode.
+    The suffix expander recurses over the wildcard string left-to-right,
+    consuming one token at a time (* / ** / *** / ? / ??).
     """
     src = pattern.source   # e.g. "591*" or "59**" or "1***??"
 
-    # Split source into fixed prefix + wildcard suffix
-    # e.g. "591*"  → prefix="591", suffix="*"
-    #      "59**"  → prefix="59",  suffix="**"
-    #      "1***??" → prefix="1", suffix="***??"
+    # Find fixed prefix (up to first wildcard char)
     first_wild = len(src)
     for i, ch in enumerate(src):
         if ch in ("*", "?"):
@@ -1381,47 +1614,58 @@ def _enumerate_glob(pattern: ChannelPattern,
     prefix = src[:first_wild]
     suffix = src[first_wild:]   # wildcard portion
 
-    # Build list of suffix expansions
     def expand_suffix(s: str) -> list[str]:
-        """
-        Expand wildcard suffix into concrete strings, digits-first.
-        Returns 1-char digit suffixes, then 1-char alpha, then 2-char
-        digit/digit, then mixed — so numeric postal codes like 5910-5919
-        are always included before alpha codes and the cap is reached.
-        """
+        """Expand wildcard suffix into concrete strings."""
         if not s:
             return [""]
-        if s[:2] == "**":
-            digits = "0123456789"
-            alpha  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ch = s[0]
+        if ch == "*":
+            # Count run of *
+            j = 0
+            while j < len(s) and s[j] == "*":
+                j += 1
+            run = j         # number of * in this token
+            rest_s = s[j:]  # remainder after this token
+            # Each * = one digit → iterate over 10^run combinations
             results = []
-            # Priority order: 2-char digit+digit first (covers 00-99, the
-            # most common postal suffix range), then 1-char, then mixed.
-            for c1 in digits:
-                for c2 in digits:
-                    results.append(c1 + c2)
-            # 1-char digits then alpha
-            for c in digits + alpha:
-                results.append(c)
-            # 2-char mixed
-            for c1 in _SCAN_CHARS:
-                for c2 in _SCAN_CHARS:
-                    combo = c1 + c2
-                    if combo not in results:
-                        results.append(combo)
+            # Use itertools-style nested expansion for arbitrary run lengths
+            def _digit_combos(n):
+                if n == 0:
+                    yield ""
+                    return
+                for d in _SCAN_DIGITS:
+                    for tail in _digit_combos(n - 1):
+                        yield d + tail
+            for combo in _digit_combos(run):
+                for rest in expand_suffix(rest_s):
+                    results.append(combo + rest)
                     if len(results) >= max_codes * 8:
                         return results
             return results
-        elif s[0] in ("*", "?"):
+        elif ch == "?":
+            # Count run of ?
+            j = 0
+            while j < len(s) and s[j] == "?":
+                j += 1
+            run = j
+            rest_s = s[j:]
+            def _alpha_combos(n):
+                if n == 0:
+                    yield ""
+                    return
+                for a in _SCAN_ALPHA:
+                    for tail in _alpha_combos(n - 1):
+                        yield a + tail
             results = []
-            for c in _SCAN_CHARS:
-                for rest in expand_suffix(s[1:]):
-                    results.append(c + rest)
+            for combo in _alpha_combos(run):
+                for rest in expand_suffix(rest_s):
+                    results.append(combo + rest)
                     if len(results) >= max_codes * 8:
                         return results
             return results
         else:
-            return [s[0] + rest for rest in expand_suffix(s[1:])]
+            # Literal character
+            return [ch + rest for rest in expand_suffix(s[1:])]
 
     suffixes = expand_suffix(suffix)
     codes = []
@@ -1457,7 +1701,7 @@ def _expand_scan_candidates(pattern: ChannelPattern) -> list[str]:
 
     All results are deduped and capped at SCAN_MAX_CANDIDATES.
     """
-    if pattern.kind == "exact":
+    if pattern.kind in ("exact", "freq"):
         return [pattern.key]
 
     seen: set[str] = set()
@@ -1787,8 +2031,8 @@ class GeoTalk:
         sock = self.mcast.join(key)
         _start_rx(sock, key)
 
-        if pat.kind == "exact":
-            return   # nothing more to do
+        if not pat.is_wildcard():
+            return   # exact and freq channels: nothing more to do
 
         # Wildcard/regex: enumerate concrete codes and join each group
         sub_keys: list[str] = []
@@ -1813,6 +2057,12 @@ class GeoTalk:
             self._rx_threads.pop(sub_key, None)
 
     def join_channel(self, raw: str) -> str:
+        # Strip GLOB:/REGEX: prefix that may arrive from active_channels().
+        # FREQ: is intentional — do NOT strip it.
+        for pfx in ("GLOB:", "REGEX:"):
+            if raw.upper().startswith(pfx):
+                raw = raw[len(pfx):]
+                break
         try:
             pat = parse_channel(raw)
         except ValueError as e:
@@ -1834,7 +2084,7 @@ class GeoTalk:
             # (e.g. BOB on #5912) to CHARLIE who joined #591*.
             self.relay.subscribe(self.nick, key)
             sub_keys: list[str] = []
-            if pat.kind != "exact":
+            if pat.is_wildcard():
                 for code in _enumerate_glob(pat, SCAN_MAX_CANDIDATES):
                     if code != key:
                         self.relay.subscribe(self.nick, code)
@@ -1932,8 +2182,7 @@ class GeoTalk:
             if self.active:
                 self._channel_history.append(self.active)
             self.active = key
-        region = _lookup_region(pat.source, self._current_country) if pat.kind == "exact" \
-                 else pat.region_info(self._current_country)
+        region = pat.region_info(self._current_country)
         return (f"{CY}Active → #{pat.display()}{R}  "
                 f"{DM}{region}{R}")
 
@@ -2220,6 +2469,10 @@ class GeoTalk:
             if pat.kind == "exact":
                 if sender_postal != pat.source and pkt.get("p") != key:
                     continue
+            elif pat.kind == "freq":
+                # freq channels match only by exact key — no postal matching
+                if pkt.get("p") != key:
+                    continue
             else:
                 if not pat.matches(sender_postal) and pkt.get("p") != key:
                     continue
@@ -2390,9 +2643,38 @@ class GeoTalk:
 
     def _render_active_rsp(self, pkt: dict):
         """Render the active-channel list returned by the relay."""
-        channels = pkt.get("channels", {})   # {channel_key: [nick, ...]}
-        ts_str   = datetime.fromtimestamp(pkt.get("ts", time.time())).strftime("%H:%M:%S")
-        if not channels:
+        raw_channels = pkt.get("channels", {})   # {channel_key: [nick, ...]}
+        ts_str = datetime.fromtimestamp(pkt.get("ts", time.time())).strftime("%H:%M:%S")
+
+        # Strip GLOB:/REGEX: prefixes and collapse sub-keys.
+        # The relay registry contains both the glob key (GLOB:59**) and every
+        # concrete sub-key (5900, 5901 … 5999).  We want to show only the
+        # top-level joinable channels: keep globs, drop exact codes that are
+        # already covered by a glob in the same response.
+        def _strip_pfx(k):
+            for pfx in ("GLOB:", "REGEX:"):
+                if k.upper().startswith(pfx):
+                    return k[len(pfx):]
+            return k
+
+        clean: dict[str, list] = {}   # stripped_key → merged nick list
+        for rk, nicks in raw_channels.items():
+            sk = _strip_pfx(rk)
+            if sk not in clean:
+                clean[sk] = list(nicks)
+            else:
+                clean[sk] = sorted(set(clean[sk]) | set(nicks))
+
+        glob_patterns = [k for k in clean if "*" in k or "?" in k]
+        filtered: dict[str, list] = {}
+        for sk, nicks in clean.items():
+            if "*" in sk or "?" in sk:
+                filtered[sk] = nicks
+            else:
+                if not any(ChannelPattern(g).matches(sk) for g in glob_patterns):
+                    filtered[sk] = nicks
+
+        if not filtered:
             sys.stdout.write(
                 f"\r{DM}{'─' * 60}{R}\n"
                 f"\r{CY}  📡 Active channels on relay{R}  {DM}(as of {ts_str}){R}\n"
@@ -2403,9 +2685,10 @@ class GeoTalk:
             return
 
         # Sort: channels we're already on first, then alphabetically
-        my_keys = set(self.channels.keys())
-        sorted_ch = sorted(channels.items(),
-                           key=lambda kv: (kv[0] not in my_keys, kv[0]))
+        my_keys = set(self.channels.keys())          # these carry GLOB: prefix
+        my_raw  = {_strip_pfx(k) for k in my_keys}  # stripped for comparison
+        sorted_ch = sorted(filtered.items(),
+                           key=lambda kv: (kv[0] not in my_raw, kv[0]))
 
         sys.stdout.write(
             f"\r{DM}{'─' * 60}{R}\n"
@@ -2414,7 +2697,7 @@ class GeoTalk:
             f"{'s' if len(sorted_ch) != 1 else ''}){R}\n")
         for ch_key, nicks in sorted_ch:
             region  = _lookup_region(ch_key, self._current_country)
-            joined  = f" {GR}[joined]{R}" if ch_key in my_keys else ""
+            joined  = f" {GR}[joined]{R}" if ch_key in my_raw else ""
             n_users = len(nicks)
             nick_str = ", ".join(nicks[:6])
             if n_users > 6:
@@ -2462,11 +2745,18 @@ class GeoTalk:
         while self._running:
             time.sleep(60)
             for key in list(self.channels.keys()):
-                self._send(key, encode_ping(self.nick, key))
-            # Keep relay subscription alive
+                # Send ping on the primary channel key only (not fan-out to
+                # sub-keys — pings are presence signals, not content).
+                if self.relay_mode:
+                    self.relay.send(encode_ping(self.nick, key))
+                else:
+                    self.mcast.send(key, encode_ping(self.nick, key))
+            # Keep relay subscriptions alive (primary key + all sub-keys)
             if self.relay_mode and self.relay.is_connected():
-                for key, ch in list(self.channels.items()):
+                for key in list(self.channels.keys()):
                     self.relay.subscribe(self.nick, key)
+                    for sub_key in self._glob_socks.get(key, []):
+                        self.relay.subscribe(self.nick, sub_key)
 
     def stop(self):
         self._running = False
@@ -2494,6 +2784,8 @@ HELP_TEXT = f"""
   {YL}#5***{R}              Wildcard — all NL postcodes starting with 5
   {YL}#75***{R}             Wildcard — Paris region
   {YL}#/^59[0-9]{{3}}$/{R}  Regex channel (Python regex between //)
+  {YL}#FREQ:145500{R}       Frequency channel — 145.500 MHz (kHz integer)
+  {YL}#FREQ:145.500{R}      Same — MHz decimal accepted (converted to kHz)
   {YL}/join 59**{R}         Join wildcard channel (stays in background)
   {YL}/leave{R}             Leave the active channel (auto-switches to previous)
   {YL}/leave 59**{R}        Leave a specific channel
@@ -2804,9 +3096,7 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
             if gt.channels:
                 lines.append("")
                 for k, ch in gt.channels.items():
-                    region = _lookup_region(ch.pattern.source, gt._current_country) \
-                             if ch.pattern.kind == "exact" \
-                             else ch.pattern.region_info(gt._current_country).split(";")[0]
+                    region = ch.pattern.region_info(gt._current_country).split(";")[0]
                     if gt.relay_mode:
                         net = f"relay={gt.relay.relay_addr_str()}"
                     else:
@@ -2956,20 +3246,23 @@ def build_prompt(gt: GeoTalk) -> str:
 def _fetch_active_channels(gt: "GeoTalk", timeout: float = 5.0) -> list[str]:
     """
     Send ACTIVE_REQ to the relay and block until ACTIVE_RSP arrives or timeout.
-    Returns a sorted list of channel keys that have at least one subscriber.
-    Must be called after gt.start() and relay connection is established.
+    Returns a sorted list of raw channel patterns (no GLOB:/REGEX: prefix) that
+    have at least one subscriber, suitable for passing directly to join_channel().
+
+    Sub-keys (plain exact codes that were registered as part of a wildcard
+    subscription) are filtered out — the caller only receives the top-level
+    joinable channels.
     """
     event    = threading.Event()
-    result   = []
+    raw_keys = []
 
-    # Temporarily wrap the relay packet callback to intercept active_rsp
     original_cb = gt.relay.on_packet
 
     def patched_cb(data: bytes, addr: tuple):
         pkt = decode_packet(data)
         if pkt and pkt.get("type") == "active_rsp":
             channels = pkt.get("channels", {})
-            result.extend(sorted(channels.keys()))
+            raw_keys.extend(channels.keys())
             event.set()
         else:
             if original_cb:
@@ -2978,8 +3271,31 @@ def _fetch_active_channels(gt: "GeoTalk", timeout: float = 5.0) -> list[str]:
     gt.relay.on_packet = patched_cb
     gt.relay.send(encode_active_req(gt.nick))
     event.wait(timeout=timeout)
-    gt.relay.on_packet = original_cb   # restore
-    return result
+    gt.relay.on_packet = original_cb
+
+    # Strip GLOB:/REGEX: prefixes so join_channel receives plain patterns
+    stripped = []
+    for k in raw_keys:
+        for pfx in ("GLOB:", "REGEX:"):
+            if k.upper().startswith(pfx):
+                k = k[len(pfx):]
+                break
+        stripped.append(k)
+
+    # Build the set of glob patterns present in the result
+    glob_patterns = [k for k in stripped if "*" in k or "?" in k]
+
+    # Filter out exact codes that are sub-keys of a glob already in the list
+    result = []
+    for k in stripped:
+        if "*" in k or "?" in k:
+            result.append(k)   # always keep glob/wildcard keys
+        else:
+            # Keep exact code only if no glob in the result matches it
+            if not any(ChannelPattern(g).matches(k) for g in glob_patterns):
+                result.append(k)
+
+    return sorted(set(result))
 
 
 def main():
@@ -3062,6 +3378,11 @@ Examples:
         print(f"  {DM}Mode: LAN multicast UDP  (239.73.0.0/16){iface_note}{R}")
         print(f"  {DM}For internet use, add --relay <host>  •  "
               f"For Wi-Fi, add --local-if <your-IP>{R}\n")
+
+    # ── auto-join system channels in relay mode ───────────────────────────
+    if gt.relay_mode:
+        for ch in ("INFO", "EMERGENCY"):
+            print(gt.join_channel(ch))
 
     # ── auto-channel: detect location from public IP ─────────────────────
     if args.auto_channel:
