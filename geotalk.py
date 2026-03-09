@@ -47,7 +47,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "1.9.0"
+VERSION      = "1.9.2"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -2357,6 +2357,16 @@ class GeoTalk:
         """Render BBS messages received from the relay after joining a channel."""
         channel  = pkt.get("p", "?")
         messages = pkt.get("msgs", [])
+
+        # Relay rejected the BBS_POST (e.g. system channel is read-only)
+        if pkt.get("error"):
+            err_msg = pkt.get("error_msg", f"#{channel} BBS is read-only")
+            sys.stdout.write(
+                f"\r{YL}  ⚠  {err_msg}{R}\n")
+            sys.stdout.flush()
+            self._redraw_prompt()
+            return
+
         if not messages:
             return
         region = _lookup_region(channel, self._current_country)

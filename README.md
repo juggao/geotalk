@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.9.0**
+**Version 1.9.2**
 
 ---
 
@@ -34,6 +34,7 @@ via a relay server.
 | 🖥️ | Desktop GUI | `geotalk-gui.py` — tkinter interface with channel sidebar, PTT button, message log, REPL, status bar, and saved settings |
 | 📡 | Active channel list | `/active` queries the relay for all channels that currently have subscribers — shows nicks, user count, and region |
 | 🔗 | Join-active startup | `--join-active` queries the relay on startup and immediately joins every channel that has at least one user |
+| 🔒 | System channels | Relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS messages; client BBS posts to these channels are rejected |
 
 ---
 
@@ -163,7 +164,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.9.0 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.9.2 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
@@ -329,7 +330,7 @@ The only difference from a postal code channel is that region lookup and wildcar
 ```
 
 Responses stream live as peers reply. A summary table is printed at the end.
-Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+; BBS requires relay v1.7.1+; country context requires v1.8.1+; `/active` requires relay v1.9.0+).
+Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+; BBS requires relay v1.7.1+; country context requires v1.8.1+; `/active` requires relay v1.9.0+; system channels require relay v1.9.2+).
 
 ### Channel management
 ```
@@ -554,7 +555,7 @@ Type these while the relay is running:
 | `ACK` (0x03) | Client-to-client only — dropped by relay |
 | `SCAN_REQ` (0x06) | Fan-out to channel + record `scan_id → requester addr` |
 | `SCAN_RSP` (0x07) | **Unicast back to original requester only** |
-| `BBS_POST` (0x12) | Store message in channel BBS; unicast confirmation to sender |
+| `BBS_POST` (0x12) | Store message in channel BBS; unicast confirmation to sender. **Rejected (error RSP)** if channel is a system channel |
 | `BBS_REQ` (0x13) | Fetch stored BBS messages; unicast response to requester |
 | `BBS_RSP` (0x14) | **Unicast to requester only** — delivers stored message array |
 | `ACTIVE_REQ` (0x15) | **Unicast response** — relay returns snapshot of all channels with active subscribers |
@@ -562,6 +563,30 @@ Type these while the relay is running:
 
 Stale subscriptions (idle > TTL) are pruned every 30 seconds in the background.
 Scan sessions expire after 60 seconds.
+
+### System channels
+
+The relay automatically creates three protected channels on startup:
+
+| Channel | Purpose |
+|---|---|
+| `#INFO` | Relay announcements and operator information |
+| `#TEST` | Connection and audio testing before joining regional channels |
+| `#EMERGENCY` | Urgent coordination — join here if you need immediate assistance |
+
+Each channel receives a seed BBS message from the relay itself when it is first created. Clients can join, send text and audio, and read the BBS on these channels normally. However, **BBS posts by clients are rejected** — the relay returns an error response and the client displays a warning. This keeps the BBS boards on system channels under operator control.
+
+The seed message is posted only once per channel. After a relay restart, if the BBS file already contains messages for a system channel, no duplicate seed is added.
+
+The relay operator can manage system-channel BBS content from the console:
+
+```
+bbs INFO                    # read current messages
+bbs-clear INFO              # wipe the board
+bbs INFO                    # (now empty — seed will NOT re-appear on next restart)
+```
+
+To repopulate a cleared system-channel BBS, delete the entry from the JSON file (or use `--bbs-file ''` to start fresh) and restart the relay.
 
 ---
 
@@ -665,6 +690,7 @@ sudo ufw allow 5073:5326/udp
 | ~~Desktop GUI~~ | ✅ Built-in since v1.8.2 — `geotalk-gui.py` tkinter frontend with PTT, channel sidebar, saved settings |
 | ~~Active channel list~~ | ✅ Built-in since v1.9.0 — `/active` queries relay for all live channels with subscriber counts and nicks |
 | ~~Join-active startup~~ | ✅ Built-in since v1.9.0 — `--join-active` joins every live relay channel automatically on startup |
+| ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS; client BBS posts rejected |
 
 ---
 

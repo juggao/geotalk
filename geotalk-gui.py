@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-gui.py — GeoTalk Desktop GUI  v1.8.2
+geotalk-gui.py — GeoTalk Desktop GUI  v1.9.2
 A tkinter frontend for the GeoTalk radio-over-IP client.
 
 Layout

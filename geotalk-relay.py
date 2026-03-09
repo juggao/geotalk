@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.8.0
+geotalk-relay.py — GeoTalk Relay / Bridge Server  v1.9.0
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Bridges GeoTalk UDP traffic across subnets and the internet.
@@ -18,6 +18,14 @@ BBS (Bulletin Board System)
   PKT_BBS_RSP.  Messages are auto-delivered when a client joins a channel.
   Storage is in memory (capped per channel) with optional JSON persistence.
 
+System channels
+  The relay automatically creates #INFO, #TEST, and #EMERGENCY on startup
+  with seed BBS messages explaining each channel's purpose.  Clients may
+  read and use these channels normally, but BBS_POST packets targeting them
+  are silently rejected and an error response is sent back to the sender.
+  The relay operator can manage system-channel BBS messages from the console
+  using the normal bbs-clear / bbs-post commands.
+
 Supported packet types
   0x01  TEXT       fan-out to channel subscribers
   0x02  AUDIO      fan-out to channel subscribers  (Opus or PCM, transparent)
@@ -30,6 +38,8 @@ Supported packet types
   0x12  BBS_POST   store a message in the channel BBS
   0x13  BBS_REQ    request stored BBS messages for a channel
   0x14  BBS_RSP    relay → client: deliver stored BBS messages
+  0x15  ACTIVE_REQ request list of channels with active subscribers
+  0x16  ACTIVE_RSP relay → client: deliver active channel list
 
 Usage
   python3 geotalk-relay.py [options]
@@ -77,7 +87,7 @@ from collections import defaultdict
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "1.9.0"
+VERSION  = "1.9.2"
 MAGIC    = b"GT"
 BUF_SIZE = 65536   # large enough for any codec frame (Opus ~80 B, PCM ~4 KB)
 
@@ -111,6 +121,25 @@ PKT_NAMES = {
     PKT_BBS_RSP:  "BBS_RSP",
     PKT_ACTIVE_REQ: "ACTIVE_REQ",
     PKT_ACTIVE_RSP: "ACTIVE_RSP",
+}
+
+# ── System channels ────────────────────────────────────────────────────────────
+# These channels are created automatically on relay startup.  Their BBS boards
+# are seeded with an introductory message from the relay itself.  Clients can
+# join and communicate on them normally, but may NOT post to their BBS boards —
+# BBS_POST packets targeting these channels are rejected with an error response.
+
+SYSTEM_CHANNELS: dict[str, str] = {
+    "INFO":      ("Welcome to #INFO — relay information and announcements. "
+                  "This channel is managed by the relay operator. "
+                  "BBS posts by clients are not permitted here."),
+    "TEST":      ("Welcome to #TEST — use this channel to test your connection, "
+                  "audio, and PTT before joining regional channels. "
+                  "BBS posts by clients are not permitted here."),
+    "EMERGENCY": ("⚠️  #EMERGENCY — reserved for urgent coordination only. "
+                  "Join this channel if you need immediate assistance or to "
+                  "report a critical situation. "
+                  "BBS posts by clients are not permitted here."),
 }
 
 # ANSI colours
@@ -516,6 +545,19 @@ class BbsStore:
             lines.append(f"  {DM}{ts_str}{R}  {B}{CY}[{m['n']}]{R}  {m['t']}")
         return "\n".join(lines)
 
+    def seed_system_channel(self, channel: str, text: str) -> bool:
+        """
+        Post a seed message to a system channel if it has no messages yet.
+        Returns True if a message was posted, False if messages already exist.
+        This is safe to call on every startup — it is a no-op when the BBS
+        file already contains messages for the channel (e.g. after a reload).
+        """
+        with self._lock:
+            if self._store.get(channel):
+                return False   # already seeded (loaded from file or prior run)
+        self.post("relay", channel, text)
+        return True
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -580,6 +622,12 @@ class RelayServer:
         threading.Thread(target=self._prune_loop,   daemon=True, name="prune").start()
         threading.Thread(target=self._console_loop, daemon=True, name="console").start()
 
+        # Seed system channels (no-op if BBS already has messages for them)
+        for ch, seed_text in SYSTEM_CHANNELS.items():
+            seeded = self.bbs.seed_system_channel(ch, seed_text)
+            if seeded:
+                print(f"  {DM}System channel seeded: #{ch}{R}")
+
         # Worker pool — avoids spawning a thread per AUDIO packet
         _POOL_SIZE = 8
         self._work_q: "_queue.Queue[tuple[bytes,tuple]|None]" = _queue.Queue(maxsize=2048)
@@ -638,6 +686,7 @@ class RelayServer:
 {B}{CY}   ╚═════╝  ╚══════╝  ╚═════╝     ╚═╝    ╚═╝  ╚═╝ ╚══════╝ ╚═╝  ╚═╝{R}
 {DM}  📡  Relay Server  v{VERSION}   UDP :{self.port}{R}
   {DM}BBS: {self.bbs.bbs_file or 'in-memory only'}  (max {self.bbs.max_per_channel}/channel){R}
+  {DM}System channels: {', '.join('#' + ch for ch in SYSTEM_CHANNELS)}  (BBS read-only for clients){R}
   {DM}Commands: stats · channels · clients · bbs · kick · ban · quit{R}
 """)
 
@@ -731,6 +780,21 @@ class RelayServer:
                 return
             text = meta.get("t", "").strip()
             if not text:
+                return
+            # System channels are read-only for clients
+            if postal in SYSTEM_CHANNELS:
+                err_payload = json.dumps({
+                    "p": postal, "msgs": [], "error": True,
+                    "error_msg": f"#{postal} is a system channel — BBS is read-only",
+                }).encode()
+                err_rsp = MAGIC + bytes([PKT_BBS_RSP]) + struct.pack("!H", len(err_payload)) + err_payload
+                self._sendto(err_rsp, addr)
+                if not self.quiet:
+                    print(f"{DM}{_ts()}{R} {YL}BBS_POST REJECTED{R} "
+                          f"{nick} → {CY}#{postal}{R}  "
+                          f"{DM}(system channel, read-only){R}")
+                self._logf("BBS_POST_REJECTED nick=%s channel=%s reason=system_channel",
+                           nick, postal)
                 return
             record = self.bbs.post(nick, postal, text)
             # Echo the stored record back to sender as confirmation
