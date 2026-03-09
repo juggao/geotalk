@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.9.2**
+**Version 1.9.4**
 
 ---
 
@@ -18,7 +18,7 @@ via a relay server.
 | 📮 | Exact postal channels | Any EU/UK postal code is a channel — `#59601`, `#1234AB`, `#SW1A` |
 | 🔍 | Wildcard channels | `#59**` = Venlo region · `#750**` = Paris · `#1***??` = Amsterdam |
 | 🧩 | Regex channels | `/^[0-9]{4}[A-Z]{2}$/` — full Python regex between `//` |
-| 🗺️ | Region database | 120+ EU postal prefixes resolved to human-readable region names |
+| 🗺️ | Region database | 200+ NL postal prefixes (per-district, 10xx–99xx) + DE/FR/BE/GB/ES/IT/PT/CH/AT/DK/SE/NO |
 | 💬 | Text messaging | Instant broadcast to all channel members |
 | 🎙️ | Push-to-Talk (PTT) | Real mic audio over UDP — **Opus codec** (32 kbit/s) when `opuslib` installed, raw PCM fallback |
 | 📻 | Multi-channel RX | Subscribe to many channels at once; all arrive in one terminal |
@@ -34,7 +34,7 @@ via a relay server.
 | 🖥️ | Desktop GUI | `geotalk-gui.py` — tkinter interface with channel sidebar, PTT button, message log, REPL, status bar, and saved settings |
 | 📡 | Active channel list | `/active` queries the relay for all channels that currently have subscribers — shows nicks, user count, and region |
 | 🔗 | Join-active startup | `--join-active` queries the relay on startup and immediately joins every channel that has at least one user |
-| 🔒 | System channels | Relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS messages; client BBS posts to these channels are rejected |
+| 🚨 | System channels | Relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS messages. `#INFO` and `#EMERGENCY` are joined automatically on relay startup; `#TEST` is not. Client BBS posts to system channels are rejected |
 
 ---
 
@@ -164,7 +164,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.9.2 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.9.4 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
@@ -274,15 +274,23 @@ All three modes use the same `#` prefix:
 
 ### Wildcard (glob)
 ```
-#59**       all NL codes 59xx    → Venlo regio
-#591???     all NL codes 591xxx  → Venlo Centrum
-#1***??     all NL codes 1xxx??  → Amsterdam
-#750**      all FR codes 750xx   → Paris
-#10***      all DE codes 10xxx   → Berlin
-#SW*        all UK codes SW-     → London SW
+#59**       all NL codes 5900–5999   → Venlo regio
+#591*??     all NL codes 591x??      → Venlo Centrum
+#1***??     all NL codes 1xxx??      → Amsterdam
+#750**      all FR codes 75000–75099 → Paris
+#10***      all DE codes 10000–10999 → Berlin
+#SW*        all UK codes SW-         → London SW
 ```
 
-`*` = exactly one character · `**` = one or more characters
+Wildcard rules:
+
+| Token | Matches | Example |
+|---|---|---|
+| `*` | exactly 1 digit (0–9) | `59*` → 590–599 |
+| `**` | exactly 2 digits | `59**` → 5900–5999 |
+| `***` | exactly 3 digits | `10***` → 10000–10999 |
+| `?` | exactly 1 letter (A–Z) | `59*?` → 5900A–5999Z |
+| `??` | exactly 2 letters | `1***??` → 1000AA–9999ZZ |
 
 When you join a wildcard channel (e.g. `#591*`), GeoTalk automatically subscribes
 to all enumerated concrete groups within that pattern — so messages and audio from
@@ -568,13 +576,15 @@ Scan sessions expire after 60 seconds.
 
 The relay automatically creates three protected channels on startup:
 
-| Channel | Purpose |
-|---|---|
-| `#INFO` | Relay announcements and operator information |
-| `#TEST` | Connection and audio testing before joining regional channels |
-| `#EMERGENCY` | Urgent coordination — join here if you need immediate assistance |
+| Channel | Auto-joined on startup | Purpose |
+|---|---|---|
+| `#INFO` | ✅ yes | Relay announcements and operator information |
+| `#TEST` | ❌ no | Connection and audio testing — join manually with `#TEST` |
+| `#EMERGENCY` | ✅ yes | Urgent coordination — join here if you need immediate assistance |
 
 Each channel receives a seed BBS message from the relay itself when it is first created. Clients can join, send text and audio, and read the BBS on these channels normally. However, **BBS posts by clients are rejected** — the relay returns an error response and the client displays a warning. This keeps the BBS boards on system channels under operator control.
+
+Auto-join applies only in relay mode (`--relay HOST`). In LAN multicast mode the system channels are not joined automatically.
 
 The seed message is posted only once per channel. After a relay restart, if the BBS file already contains messages for a system channel, no duplicate seed is added.
 
@@ -686,11 +696,12 @@ sudo ufw allow 5073:5326/udp
 | TNC / APRS bridge | Encode messages as AX.25 UI frames for RF transmission |
 | Relay clustering | Multiple relay nodes sharing a channel registry over a message bus |
 | ~~BBS~~ | ✅ Built-in since v1.7.1 — persistent per-channel bulletin board on the relay |
+| ~~NL postcode DB~~ | ✅ Expanded in v1.9.4 — full per-district coverage 10xx–99xx (200+ entries), bare 4-digit lookups, corrected labels throughout |
 | ~~Country context~~ | ✅ Built-in since v1.8.1 — `/country CODE` filters region labels; auto-set by `--auto-channel` |
 | ~~Desktop GUI~~ | ✅ Built-in since v1.8.2 — `geotalk-gui.py` tkinter frontend with PTT, channel sidebar, saved settings |
 | ~~Active channel list~~ | ✅ Built-in since v1.9.0 — `/active` queries relay for all live channels with subscriber counts and nicks |
 | ~~Join-active startup~~ | ✅ Built-in since v1.9.0 — `--join-active` joins every live relay channel automatically on startup |
-| ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS; client BBS posts rejected |
+| ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY`; `#INFO` and `#EMERGENCY` auto-joined on startup, `#TEST` manual only; client BBS posts rejected |
 
 ---
 
