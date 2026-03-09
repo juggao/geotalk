@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 1.8.2**
+**Version 1.9.0**
 
 ---
 
@@ -32,6 +32,8 @@ via a relay server.
 | 📋 | BBS | `/bbs TEXT` posts a persistent message to the channel bulletin board; messages are auto-delivered on join (relay mode only) |
 | 🌍 | Country context | `/country NL` filters all region labels to one country — no cross-country noise on shared postal prefixes |
 | 🖥️ | Desktop GUI | `geotalk-gui.py` — tkinter interface with channel sidebar, PTT button, message log, REPL, status bar, and saved settings |
+| 📡 | Active channel list | `/active` queries the relay for all channels that currently have subscribers — shows nicks, user count, and region |
+| 🔗 | Join-active startup | `--join-active` queries the relay on startup and immediately joins every channel that has at least one user |
 
 ---
 
@@ -108,6 +110,23 @@ On startup you'll see:
 Uses ip-api.com (primary) and ipinfo.io (fallback) — both free, no API key required.
 If detection fails (VPN, offline) a message is shown and you can join manually with `#POSTCODE`.
 
+### Join-active — join every live channel on the relay
+
+```bash
+# Query the relay on startup and join all channels that currently have subscribers
+python3 geotalk.py --nick PA3XYZ --relay relay.example.com --join-active
+```
+
+On startup you'll see:
+```
+  Found 3 active channels  (#59**, #5911AB, #1***??)
+  Joined #59**    → relay=relay.example.com:5073  Venlo regio
+  Joined #5911AB  → relay=relay.example.com:5073  Venlo (NL)
+  Joined #1***??  → relay=relay.example.com:5073  Amsterdam
+```
+
+GeoTalk sends a single `ACTIVE_REQ` to the relay, waits up to 5 seconds for the response, then joins each returned channel in one shot. If the relay has no active channels, or does not respond within the timeout, a prompt to join manually is shown instead. `--join-active` requires `--relay` and is silently ignored in LAN multicast mode.
+
 ---
 
 ## Desktop GUI
@@ -144,7 +163,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.8.2 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v1.9.0 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
@@ -232,6 +251,8 @@ python3 geotalk.py --nick BOB   --local-if 192.168.178.164 --debug
 --relay HOST          Relay server hostname or IP  ← enables relay mode
 --relay-port PORT     Relay server port (default 5073)
 --join PATTERN ...    Channels to join on startup
+--join-active         Query relay for active channels and join them all on startup
+                      (relay mode only; ignored without --relay)
 --auto-channel        Detect location from public IP and auto-join nearest channel
 --debug               Print verbose multicast debug lines to stderr
 ```
@@ -296,7 +317,7 @@ Full Python regex syntax enclosed in `/` `/`.
 ```
 
 Responses stream live as peers reply. A summary table is printed at the end.
-Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+; BBS requires relay v1.7.1+; country context requires v1.8.1+).
+Requires all peers to be on v1.3.0 or later (relay requires v1.4.0+; auto-channel requires v1.5.0+; Opus requires v1.6.0+; BBS requires relay v1.7.1+; country context requires v1.8.1+; `/active` requires relay v1.9.0+).
 
 ### Channel management
 ```
@@ -391,12 +412,26 @@ BBS is not available in LAN multicast mode — use `--relay HOST` to enable it.
 ### Info & status
 ```
 /users      Active users on current channel (last 5 min)
+/active     Ask relay which channels currently have subscribers (relay mode only)
 /info       Transport mode, audio settings, codec, all joined channels
 /relay      Relay connection status (relay mode only)
 /whoami     Your callsign
 /help       Full in-app help
 /quit  /q   Exit
 ```
+
+`/active` sends a single `ACTIVE_REQ` packet to the relay, which responds with a snapshot of every channel that currently has at least one subscriber. Results are displayed with user counts, nicks, and region labels; channels you've already joined are marked `[joined]` and sorted to the top:
+
+```
+────────────────────────────────────────────────────────────
+  📡 Active channels on relay  (as of 14:32:07 — 3 channels)
+  #59**         [joined]  2 users  PA3XYZ, PE1ABC   Venlo regio
+  #5911AB                 1 user   ON4XYZ            Venlo (NL)
+  #1***??                 3 users  PD0XYZ, PA0XYZ, PI4ZZZ  Amsterdam
+────────────────────────────────────────────────────────────
+```
+
+`/active` is relay-mode only — in LAN multicast mode use `/scan **` to discover peers instead.
 
 ---
 
@@ -510,6 +545,8 @@ Type these while the relay is running:
 | `BBS_POST` (0x12) | Store message in channel BBS; unicast confirmation to sender |
 | `BBS_REQ` (0x13) | Fetch stored BBS messages; unicast response to requester |
 | `BBS_RSP` (0x14) | **Unicast to requester only** — delivers stored message array |
+| `ACTIVE_REQ` (0x15) | **Unicast response** — relay returns snapshot of all channels with active subscribers |
+| `ACTIVE_RSP` (0x16) | **Unicast to requester only** — delivers `{channel: [nicks]}` map |
 
 Stale subscriptions (idle > TTL) are pruned every 30 seconds in the background.
 Scan sessions expire after 60 seconds.
@@ -544,6 +581,8 @@ The JSON "codec" field specifies encoding: "opus" (compressed) or "pcm" (raw int
 | BBS_POST | 0x12 | `n` nick · `p` channel · `t` text · `ts` | Store BBS message |
 | BBS_REQ | 0x13 | `n` · `p` · `ts` | Request BBS messages for channel |
 | BBS_RSP | 0x14 | `p` · `msgs` [{id, n, p, t, ts}, …] | BBS message delivery |
+| ACTIVE_REQ | 0x15 | `n` · `ts` | Request active channel list from relay |
+| ACTIVE_RSP | 0x16 | `channels` {key: [nick, …]} · `ts` | Active channel snapshot |
 
 ### Multicast address mapping (LAN mode)
 
@@ -612,6 +651,8 @@ sudo ufw allow 5073:5326/udp
 | ~~BBS~~ | ✅ Built-in since v1.7.1 — persistent per-channel bulletin board on the relay |
 | ~~Country context~~ | ✅ Built-in since v1.8.1 — `/country CODE` filters region labels; auto-set by `--auto-channel` |
 | ~~Desktop GUI~~ | ✅ Built-in since v1.8.2 — `geotalk-gui.py` tkinter frontend with PTT, channel sidebar, saved settings |
+| ~~Active channel list~~ | ✅ Built-in since v1.9.0 — `/active` queries relay for all live channels with subscriber counts and nicks |
+| ~~Join-active startup~~ | ✅ Built-in since v1.9.0 — `--join-active` joins every live relay channel automatically on startup |
 
 ---
 

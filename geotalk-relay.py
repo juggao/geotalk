@@ -77,7 +77,7 @@ from collections import defaultdict
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "1.8.2"
+VERSION  = "1.9.0"
 MAGIC    = b"GT"
 BUF_SIZE = 65536   # large enough for any codec frame (Opus ~80 B, PCM ~4 KB)
 
@@ -94,6 +94,8 @@ PKT_LEAVE    = 0x11
 PKT_BBS_POST = 0x12   # client → relay: store a BBS message
 PKT_BBS_REQ  = 0x13   # client → relay: request stored messages for a channel
 PKT_BBS_RSP  = 0x14   # relay → client: deliver stored messages
+PKT_ACTIVE_REQ = 0x15  # client → relay: request list of channels with active subscribers
+PKT_ACTIVE_RSP = 0x16  # relay → client: deliver active channel list
 
 PKT_NAMES = {
     PKT_TEXT:     "TEXT",
@@ -107,6 +109,8 @@ PKT_NAMES = {
     PKT_BBS_POST: "BBS_POST",
     PKT_BBS_REQ:  "BBS_REQ",
     PKT_BBS_RSP:  "BBS_RSP",
+    PKT_ACTIVE_REQ: "ACTIVE_REQ",
+    PKT_ACTIVE_RSP: "ACTIVE_RSP",
 }
 
 # ANSI colours
@@ -268,6 +272,20 @@ class ClientRegistry:
         with self._lock:
             return [a for a in self._channels.get(channel, set())
                     if a != exclude]
+
+    def active_channels(self) -> dict[str, list[str]]:
+        """Return {channel_key: [nick, ...]} for all channels with at least one subscriber."""
+        with self._lock:
+            result = {}
+            for ch, addrs in self._channels.items():
+                if not addrs:
+                    continue
+                nicks = []
+                for addr in addrs:
+                    client = self._clients.get(addr)
+                    nicks.append(client.nick if client else f"{addr[0]}:{addr[1]}")
+                result[ch] = sorted(nicks)
+            return result
 
     def record_rx(self, addr: tuple, nbytes: int):
         with self._lock:
@@ -741,6 +759,23 @@ class RelayServer:
                       f"{nick or addr[0]} → {CY}#{postal}{R}  "
                       f"{DM}({len(msgs)} msg(s) delivered){R}")
             self._logf("BBS_REQ nick=%s channel=%s msgs=%d", nick, postal, len(msgs))
+            return
+
+        # ── ACTIVE_REQ — unicast active channel list back to requester ───────
+        if ptype == PKT_ACTIVE_REQ:
+            active = self.registry.active_channels()
+            rsp_payload = json.dumps({
+                "channels": active,
+                "ts": int(time.time()),
+            }).encode()
+            rsp = MAGIC + bytes([PKT_ACTIVE_RSP]) + struct.pack("!H", len(rsp_payload)) + rsp_payload
+            self._sendto(rsp, addr)
+            if not self.quiet:
+                print(f"{DM}{_ts()}{R} {MG}ACTIVE_REQ{R} "
+                      f"{nick or addr[0]}  "
+                      f"{DM}→ {len(active)} channel(s){R}")
+            self._logf("ACTIVE_REQ nick=%s addr=%s:%s channels=%d",
+                       nick, addr[0], addr[1], len(active))
             return
 
         # Unknown — drop silently but log

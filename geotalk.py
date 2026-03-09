@@ -47,7 +47,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "1.8.2"
+VERSION      = "1.9.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -69,9 +69,11 @@ PKT_SCAN_RSP = 0x07   # scan: "yes, I am — here is my info"
 PKT_JOIN     = 0x10
 PKT_LEAVE    = 0x11
 # BBS (relay mode only)
-PKT_BBS_POST = 0x12   # client → relay: store a BBS message
-PKT_BBS_REQ  = 0x13   # client → relay: request BBS messages for a channel
-PKT_BBS_RSP  = 0x14   # relay → client: deliver BBS messages (JSON array)
+PKT_BBS_POST    = 0x12   # client → relay: store a BBS message
+PKT_BBS_REQ     = 0x13   # client → relay: request BBS messages for a channel
+PKT_BBS_RSP     = 0x14   # relay → client: deliver BBS messages (JSON array)
+PKT_ACTIVE_REQ  = 0x15   # client → relay: request list of active channels
+PKT_ACTIVE_RSP  = 0x16   # relay → client: deliver active channel list
 
 # ANSI colours
 R  = "\033[0m"
@@ -687,6 +689,11 @@ def encode_bbs_req(nick: str, postal: str) -> bytes:
                           "ts": int(time.time())}).encode()
     return MAGIC + bytes([PKT_BBS_REQ]) + struct.pack("!H", len(payload)) + payload
 
+def encode_active_req(nick: str) -> bytes:
+    """Client → relay: request the list of channels that currently have subscribers."""
+    payload = json.dumps({"n": nick, "ts": int(time.time())}).encode()
+    return MAGIC + bytes([PKT_ACTIVE_REQ]) + struct.pack("!H", len(payload)) + payload
+
 def decode_packet(data: bytes) -> dict | None:
     if len(data) < 5 or data[:2] != MAGIC:
         return None
@@ -731,6 +738,12 @@ def decode_packet(data: bytes) -> dict | None:
     if ptype == PKT_BBS_RSP:
         try:
             return {"type": "bbs_rsp", **json.loads(body[:plen])}
+        except Exception:
+            return None
+
+    if ptype == PKT_ACTIVE_RSP:
+        try:
+            return {"type": "active_rsp", **json.loads(body[:plen])}
         except Exception:
             return None
 
@@ -2182,6 +2195,11 @@ class GeoTalk:
             self._render_bbs_rsp(pkt)
             return
 
+        # ── active_rsp: relay → client, display active channel list ────────
+        if pkt_type == "active_rsp":
+            self._render_active_rsp(pkt)
+            return
+
         if nick == self.nick:
             return   # suppress own echo for other packet types
 
@@ -2360,6 +2378,46 @@ class GeoTalk:
         sys.stdout.flush()
         self._redraw_prompt()
 
+    def _render_active_rsp(self, pkt: dict):
+        """Render the active-channel list returned by the relay."""
+        channels = pkt.get("channels", {})   # {channel_key: [nick, ...]}
+        ts_str   = datetime.fromtimestamp(pkt.get("ts", time.time())).strftime("%H:%M:%S")
+        if not channels:
+            sys.stdout.write(
+                f"\r{DM}{'─' * 60}{R}\n"
+                f"\r{CY}  📡 Active channels on relay{R}  {DM}(as of {ts_str}){R}\n"
+                f"\r  {DM}(no active channels){R}\n"
+                f"\r{DM}{'─' * 60}{R}\n")
+            sys.stdout.flush()
+            self._redraw_prompt()
+            return
+
+        # Sort: channels we're already on first, then alphabetically
+        my_keys = set(self.channels.keys())
+        sorted_ch = sorted(channels.items(),
+                           key=lambda kv: (kv[0] not in my_keys, kv[0]))
+
+        sys.stdout.write(
+            f"\r{DM}{'─' * 60}{R}\n"
+            f"\r{CY}  📡 Active channels on relay{R}  "
+            f"{DM}(as of {ts_str} — {len(sorted_ch)} channel"
+            f"{'s' if len(sorted_ch) != 1 else ''}){R}\n")
+        for ch_key, nicks in sorted_ch:
+            region  = _lookup_region(ch_key, self._current_country)
+            joined  = f" {GR}[joined]{R}" if ch_key in my_keys else ""
+            n_users = len(nicks)
+            nick_str = ", ".join(nicks[:6])
+            if n_users > 6:
+                nick_str += f" {DM}+{n_users - 6} more{R}"
+            sys.stdout.write(
+                f"\r  {B}{CY}#{ch_key:<12}{R}{joined}"
+                f"  {DM}{n_users} user{'s' if n_users != 1 else ''}{R}"
+                f"  {YL}{nick_str}{R}"
+                f"  {DM}{region}{R}\n")
+        sys.stdout.write(f"\r{DM}{'─' * 60}{R}\n")
+        sys.stdout.flush()
+        self._redraw_prompt()
+
     def _redraw_prompt(self):
         ch = self.channels.get(self.active)
         label = ch.pattern.display() if ch else (self.active or "?")
@@ -2459,6 +2517,7 @@ HELP_TEXT = f"""
 
 {B}Info{R}
   {YL}/users{R}             Active users on current channel
+  {YL}/active{R}            Ask relay which channels have users (relay mode only)
   {YL}/info{R}              Network info (multicast addr / relay, port)
   {YL}/relay{R}             Relay connection status
   {YL}/whoami{R}            Show your callsign
@@ -2758,6 +2817,14 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
                     f"status={conn}  "
                     f"channels={len(gt.channels)}")
 
+        if cmd0 == "active":
+            if not gt.relay_mode:
+                return f"{YL}/active requires relay mode.  Start with --relay HOST{R}"
+            if not gt.relay.is_connected():
+                return f"{RD}Relay not connected.{R}"
+            gt.relay.send(encode_active_req(gt.nick))
+            return f"{DM}Querying relay for active channels…{R}"
+
         return f"{YL}Unknown command /{cmd0}. Type /help{R}"
 
     # ── plain text → send to active channel ──────────────────────────────
@@ -2876,6 +2943,35 @@ def build_prompt(gt: GeoTalk) -> str:
     mute = f" {YL}[M]{R}" if (AUDIO_AVAILABLE and gt.audio.pa and gt.audio.is_muted) else ""
     return f"{B}{GR}{gt.nick}{R}@{B}{CY}#{label}{R}{ptt}{mute}> "
 
+def _fetch_active_channels(gt: "GeoTalk", timeout: float = 5.0) -> list[str]:
+    """
+    Send ACTIVE_REQ to the relay and block until ACTIVE_RSP arrives or timeout.
+    Returns a sorted list of channel keys that have at least one subscriber.
+    Must be called after gt.start() and relay connection is established.
+    """
+    event    = threading.Event()
+    result   = []
+
+    # Temporarily wrap the relay packet callback to intercept active_rsp
+    original_cb = gt.relay.on_packet
+
+    def patched_cb(data: bytes, addr: tuple):
+        pkt = decode_packet(data)
+        if pkt and pkt.get("type") == "active_rsp":
+            channels = pkt.get("channels", {})
+            result.extend(sorted(channels.keys()))
+            event.set()
+        else:
+            if original_cb:
+                original_cb(data, addr)
+
+    gt.relay.on_packet = patched_cb
+    gt.relay.send(encode_active_req(gt.nick))
+    event.wait(timeout=timeout)
+    gt.relay.on_packet = original_cb   # restore
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="GeoTalk — postal-code-based voice & text over UDP multicast/relay",
@@ -2894,6 +2990,9 @@ Examples:
 
   # Join channels on startup
   python3 geotalk.py --nick PA3XYZ --relay relay.example.com --join 59** 1***??
+
+  # Join every channel that currently has users on the relay
+  python3 geotalk.py --nick PA3XYZ --relay relay.example.com --join-active
 
   # Auto-join based on your public IP location
   python3 geotalk.py --nick PA3XYZ --auto-channel
@@ -2920,6 +3019,9 @@ Examples:
                         help="Channel patterns to join on startup (e.g. 59** 1***??)")
     parser.add_argument("--auto-channel", action="store_true",
                         help="Detect location from public IP and auto-join nearest postal channel")
+    parser.add_argument("--join-active",  action="store_true",
+                        help="Query relay for all active channels and join them all on startup "
+                             "(relay mode only; ignored without --relay)")
     args = parser.parse_args()
 
     # ── pick callsign ─────────────────────────────────────────────────────
@@ -2972,6 +3074,26 @@ Examples:
             print(gt.join_channel(raw))
     elif not args.auto_channel:
         print(f"{DM}Tip: {YL}#59**{DM} = Venlo region  •  {YL}#1***??{DM} = Amsterdam  •  {YL}/help{DM} for all commands{R}\n")
+
+    # ── join-active: query relay and join all live channels ───────────────
+    if args.join_active:
+        if not gt.relay_mode:
+            print(f"{YL}  --join-active requires --relay HOST (ignored in LAN mode){R}")
+        elif not gt.relay.is_connected():
+            print(f"{YL}  --join-active: relay not connected, skipping{R}")
+        else:
+            print(f"{DM}  Querying relay for active channels\u2026{R}", end="", flush=True)
+            active_keys = _fetch_active_channels(gt, timeout=5.0)
+            if active_keys:
+                print(f"\r  {GR}Found {len(active_keys)} active channel"
+                      f"{'s' if len(active_keys) != 1 else ''}{R}  "
+                      f"{DM}({', '.join('#' + k for k in active_keys[:8])}"
+                      f"{'…' if len(active_keys) > 8 else ''}){R}")
+                for key in active_keys:
+                    print(gt.join_channel(key))
+            else:
+                print(f"\r  {YL}No active channels found on relay (or timed out){R}"
+                      f"  \u2014 use {YL}#POSTCODE{R} to join manually")
 
     # ── signal handler ────────────────────────────────────────────────────
     def sigint_handler(sig, frame):

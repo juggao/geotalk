@@ -34,11 +34,22 @@ if _here not in sys.path:
 
 # Silence pyaudio ALSA noise before import
 import ctypes
+
+# Suppress ALSA "no such file or directory" spam on stderr.
+# IMPORTANT: the CFUNCTYPE wrapper MUST be stored in a module-level variable.
+# If it is only a temporary expression, Python's GC frees it immediately and
+# ALSA is left with a dangling function pointer — calling it from any ALSA/
+# PortAudio background thread causes a segfault.
+_ALSA_ERROR_HANDLER_T = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+    ctypes.c_int, ctypes.c_char_p,
+)
+_alsa_error_handler = _ALSA_ERROR_HANDLER_T(lambda *_: None)  # kept alive here
+
 try:
     _asound = ctypes.cdll.LoadLibrary("libasound.so.2")
-    _asound.snd_lib_error_set_handler(
-        ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
-                         ctypes.c_int, ctypes.c_char_p)(lambda *_: None))
+    _asound.snd_lib_error_set_handler(_alsa_error_handler)
 except Exception:
     pass
 
@@ -130,6 +141,7 @@ _PREFS_DEFAULTS: dict = {
     "local_if":   "",
     "country":    "NL",
     "auto_channel": False,
+    "join_active":  False,
     "window_geometry": "",
 }
 
@@ -209,6 +221,7 @@ class ConnectDialog(tk.Toplevel):
         self._iface_e  = self._entry(frame, p.get("local_if", ""))
         self._cc_e     = self._entry(frame, p.get("country", "NL"), width=6)
         self._auto_var = tk.BooleanVar(value=bool(p.get("auto_channel", False)))
+        self._join_active_var = tk.BooleanVar(value=bool(p.get("join_active", False)))
 
         row("Callsign / nick",  self._nick_e,  0)
         row("Relay host",       self._relay_e, 1)
@@ -225,6 +238,15 @@ class ConnectDialog(tk.Toplevel):
             activebackground=P["bg"], activeforeground=P["amber_pale"],
             font=("Courier", 9))
         auto_chk.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Join-active checkbox (spans both columns)
+        join_active_chk = tk.Checkbutton(
+            frame, text="Join-active (join all live relay channels on start)",
+            variable=self._join_active_var,
+            bg=P["bg"], fg=P["text"], selectcolor=P["bg3"],
+            activebackground=P["bg"], activeforeground=P["amber_pale"],
+            font=("Courier", 9))
+        join_active_chk.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         # Hints
         tk.Label(self, text="Leave relay empty for LAN multicast mode",
@@ -260,6 +282,7 @@ class ConnectDialog(tk.Toplevel):
             "local_if":     self._iface_e.get().strip() or "0.0.0.0",
             "country":      self._cc_e.get().strip().upper() or "NL",
             "auto_channel": bool(self._auto_var.get()),
+            "join_active":  bool(self._join_active_var.get()),
         }
         self.destroy()
 
@@ -518,37 +541,63 @@ class GeoTalkGUI:
             self._append_sys("Type /connect or restart to connect.")
 
     def _connect(self, cfg: dict):
+        """
+        Kick off connection on a background thread so that
+        pyaudio.PyAudio() / PortAudio initialisation never runs on the
+        tkinter main thread — that combination causes a segfault on Linux
+        because PortAudio installs ALSA signal handlers that conflict with
+        Xlib's internal locking.
+
+        Flow:
+          main thread  →  _connect()  →  spawns _connect_worker thread
+          worker thread  →  GeoTalk.__init__ + gt.start()
+                         →  posts ("connected", gt, cfg) onto self._q
+          main thread  →  _poll_queue picks it up  →  _on_connected()
+        """
+        # Stop any previous instance (safe to do on main thread — it only
+        # sets flags and closes sockets, no PortAudio calls).
         if self.gt:
-            self.gt.stop()
+            try:
+                self.gt.stop()
+            except Exception:
+                pass
             self.gt = None
 
-        # Redirect stdout before GeoTalk starts
+        # Redirect stdout now (before the worker starts) so any early
+        # GeoTalk prints are captured immediately.
         sys.stdout = _QueueWriter(self._q)
         sys.stderr = sys.stdout
 
-        try:
-            self.gt = gt_mod.GeoTalk(
-                nick=cfg["nick"],
-                relay_host=cfg["relay"],
-                relay_port=cfg["relay_port"],
-                local_if=cfg["local_if"],
-            )
-            if cfg["country"] in gt_mod.KNOWN_COUNTRIES:
-                self.gt._current_country = cfg["country"]
-            self.gt.start()
-        except Exception as e:
-            self._append_line(f"Connection failed: {e}", "error")
-            return
+        self._hdr_status.configure(text="CONNECTING…", fg=P["amber_dim"])
+        self._append_sys(f"Connecting as {cfg['nick']}…")
 
-        # Header
+        def _worker():
+            try:
+                gt = gt_mod.GeoTalk(
+                    nick=cfg["nick"],
+                    relay_host=cfg["relay"],
+                    relay_port=cfg["relay_port"],
+                    local_if=cfg["local_if"],
+                )
+                if cfg["country"] in gt_mod.KNOWN_COUNTRIES:
+                    gt._current_country = cfg["country"]
+                gt.start()
+                self._q.put(("connected", gt, cfg))
+            except Exception as e:
+                self._q.put(("connect_error", str(e)))
+
+        threading.Thread(target=_worker, daemon=True, name="gt-connect").start()
+
+    def _on_connected(self, gt: "gt_mod.GeoTalk", cfg: dict):
+        """Called on the main thread once the background connect worker succeeds."""
+        self.gt = gt
+
         mode = (f"relay → {cfg['relay']}:{cfg['relay_port']}"
                 if cfg["relay"] else "LAN multicast")
         self._hdr_status.configure(
             text=f"{cfg['nick']}  ·  {cfg['country']}  ·  {mode}",
             fg=P["green"])
-        self._hdr_right.configure(
-            text=f"v{gt_mod.VERSION}")
-
+        self._hdr_right.configure(text=f"v{gt_mod.VERSION}")
         self._append_sys(f"Connected as {cfg['nick']}  [{mode}]")
 
         # Persist settings for next launch
@@ -560,6 +609,7 @@ class GeoTalkGUI:
             "local_if":     cfg["local_if"] if cfg["local_if"] != "0.0.0.0" else "",
             "country":      cfg["country"],
             "auto_channel": cfg.get("auto_channel", False),
+            "join_active":  cfg.get("join_active",  False),
         })
         _save_prefs(self._prefs)
 
@@ -585,6 +635,36 @@ class GeoTalkGUI:
                 except Exception as e:
                     self.root.after(0, lambda: self._append_sys(f"Auto-channel error: {e}"))
             threading.Thread(target=_do_auto, daemon=True).start()
+
+        # Join-active: query relay for live channels and join them all
+        if cfg.get("join_active"):
+            if not cfg["relay"]:
+                self._append_sys("Join-active ignored — relay not configured")
+            else:
+                self._append_sys("Querying relay for active channels…")
+                def _do_join_active():
+                    try:
+                        keys = gt_mod._fetch_active_channels(self.gt, timeout=5.0)
+                        def _apply(keys=keys):
+                            if keys:
+                                self._append_sys(
+                                    f"Found {len(keys)} active channel"
+                                    f"{'s' if len(keys) != 1 else ''}: "
+                                    f"{', '.join('#' + k for k in keys[:8])}"
+                                    f"{'…' if len(keys) > 8 else ''}")
+                                for key in keys:
+                                    result = self.gt.join_channel(key)
+                                    if result:
+                                        self._ingest_result(result)
+                                self._refresh_channels()
+                            else:
+                                self._append_sys(
+                                    "No active channels found on relay (or timed out)")
+                        self.root.after(0, _apply)
+                    except Exception as e:
+                        self.root.after(0, lambda: self._append_sys(
+                            f"Join-active error: {e}"))
+                threading.Thread(target=_do_join_active, daemon=True).start()
 
         # Auto-join channels
         if cfg["join"]:
@@ -814,9 +894,15 @@ class GeoTalkGUI:
     def _poll_queue(self):
         try:
             while True:
-                kind, payload = self._q.get_nowait()
+                item = self._q.get_nowait()
+                kind = item[0]
                 if kind == "msg":
-                    self._dispatch_incoming(payload)
+                    self._dispatch_incoming(item[1])
+                elif kind == "connected":
+                    self._on_connected(item[1], item[2])   # (gt, cfg)
+                elif kind == "connect_error":
+                    self._append_line(f"Connection failed: {item[1]}", "error")
+                    self._hdr_status.configure(text="CONNECTION FAILED", fg=P["red"])
         except queue.Empty:
             pass
         self.root.after(self.POLL_MS, self._poll_queue)
