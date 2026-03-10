@@ -1372,14 +1372,21 @@ class AudioEngine:
     """
 
     # How many chunks to buffer per sender before dropping (back-pressure)
-    SENDER_QUEUE_DEPTH = 8
+    SENDER_QUEUE_DEPTH = 16
     # Seconds after last packet before a sender is evicted from the mixer
     SENDER_TIMEOUT     = 2.0
     # Mixer tick interval — should match one frame period
     MIXER_TICK         = AUDIO_CHUNK / AUDIO_RATE   # ~0.020 s at 48 kHz
     # Jitter buffer: hold up to this many frames waiting for out-of-order seq
-    # before releasing.  3 frames = ~60 ms — enough for typical internet jitter.
-    JITTER_WINDOW      = 3
+    # before releasing.  8 frames = ~160 ms — covers typical internet jitter.
+    JITTER_WINDOW      = 8
+    # PLC: maximum consecutive ticks to repeat last frame when buffer runs dry.
+    # After this many ticks the concealment fades to silence.  At 20 ms/tick
+    # this gives 60 ms of concealment before fade, well within intelligibility.
+    PLC_MAX_TICKS      = 3
+    # Output stream hardware buffer — 4× the frame size gives PortAudio enough
+    # headroom to absorb scheduler jitter without underrunning.
+    OUTPUT_BUFFER_FRAMES = AUDIO_CHUNK * 4
 
     def __init__(self):
         self.pa          = None
@@ -1435,7 +1442,7 @@ class AudioEngine:
         self._rx_stream = self.pa.open(
             format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
             rate=AUDIO_RATE, output=True,
-            frames_per_buffer=AUDIO_CHUNK)
+            frames_per_buffer=self.OUTPUT_BUFFER_FRAMES)
         self._tx_stream = self.pa.open(
             format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
             rate=AUDIO_RATE, input=True,
@@ -1463,19 +1470,33 @@ class AudioEngine:
 
     def _mixer_loop(self):
         """
-        Tick once per frame period.  Collect one chunk from every active
-        sender, mix by summing int16 samples with clipping, write to output.
-        If no sender has audio, write silence so the stream stays open.
+        Tick once per frame period using absolute-deadline scheduling to
+        prevent cumulative drift.  Collect one chunk from every active sender,
+        mix by summing int16 samples with clipping, write to output.
+
+        PLC (Packet Loss Concealment): when a sender's playback buffer is
+        empty but they are still active, repeat their last good frame for up
+        to PLC_MAX_TICKS consecutive ticks with a linear fade-out.  After
+        that the concealment stops so a long dropout decays to silence rather
+        than buzzing with a stuck frame.
+
+        Absolute-deadline scheduling: the next wakeup is always computed as
+        deadline += tick rather than sleep(tick - elapsed).  This prevents
+        OS scheduler jitter from compounding across ticks.
         """
         import struct as _struct
-        n_samples = AUDIO_CHUNK
-        silence   = b"\x00" * (n_samples * 2)   # int16 = 2 bytes per sample
-        tick      = self.MIXER_TICK
+        n_samples  = AUDIO_CHUNK
+        n_bytes    = n_samples * 2          # int16 = 2 bytes
+        silence    = b"\x00" * n_bytes
+        fmt        = f"<{n_samples}h"
+        tick       = self.MIXER_TICK
+        plc_max    = self.PLC_MAX_TICKS
+
+        deadline = time.monotonic()         # absolute next-tick target
 
         while self._running:
-            tick_start = time.monotonic()
-
-            chunks    = []   # list of bytes chunks to mix this tick
+            deadline += tick
+            chunks    = []
             evict     = []
 
             with self._sender_lock:
@@ -1486,7 +1507,24 @@ class AudioEngine:
                         continue
                     buf = state["buf"]
                     if buf:
-                        chunks.append(buf.popleft())
+                        pcm = buf.popleft()
+                        state["last_pcm"]  = pcm
+                        state["plc_ticks"] = 0
+                        chunks.append(pcm)
+                    elif state["last_pcm"] is not None and state["plc_ticks"] < plc_max:
+                        # PLC: apply a linear fade so each successive repeat is
+                        # quieter — avoids a hard cut while still decaying.
+                        t        = state["plc_ticks"]
+                        gain_num = plc_max - t      # e.g. 3,2,1 for plc_max=3
+                        gain_den = plc_max
+                        if gain_num > 0:
+                            samples = list(_struct.unpack(fmt,
+                                           state["last_pcm"][:n_bytes]))
+                            faded   = _struct.pack(fmt, *[
+                                int(s * gain_num // gain_den) for s in samples])
+                            chunks.append(faded)
+                        state["plc_ticks"] += 1
+                    # else: concealment exhausted or no frame yet — silence
 
                 for nick in evict:
                     del self._senders[nick]
@@ -1495,31 +1533,24 @@ class AudioEngine:
                 if len(chunks) == 1:
                     mixed = chunks[0]
                 else:
-                    # Unpack all chunks to int16 lists and sum with clipping
-                    fmt      = f"<{n_samples}h"
-                    arrays   = [list(_struct.unpack(fmt, c[:n_samples * 2]))
-                                for c in chunks]
-                    mixed_s  = [
-                        max(-32768, min(32767, sum(arrays[s][i]
-                                                   for s in range(len(arrays)))))
-                        for i in range(n_samples)
-                    ]
-                    mixed = _struct.pack(f"<{n_samples}h", *mixed_s)
-
+                    arrays = [list(_struct.unpack(fmt, c[:n_bytes]))
+                               for c in chunks]
+                    mixed  = _struct.pack(fmt, *[
+                        max(-32768, min(32767,
+                            sum(arrays[s][i] for s in range(len(arrays)))))
+                        for i in range(n_samples)])
                 try:
                     self._rx_stream.write(mixed)
                 except Exception:
                     pass
             else:
-                # No audio this tick — write silence to prevent underrun
                 try:
                     self._rx_stream.write(silence)
                 except Exception:
                     pass
 
-            # Sleep for the remainder of the tick period
-            elapsed = time.monotonic() - tick_start
-            sleep_t = tick - elapsed
+            # Absolute-deadline sleep — never drifts regardless of write latency
+            sleep_t = deadline - time.monotonic()
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
@@ -1590,8 +1621,10 @@ class AudioEngine:
                     "buf":        collections.deque(maxlen=self.SENDER_QUEUE_DEPTH),
                     "hold":       [],          # list of (seq, pcm) waiting to be ordered
                     "next_seq":   seq,         # next seq we expect to emit
-                    "held_since": time.monotonic(),
+                    "held_since": None,        # monotonic time when gap first detected
                     "last":       time.monotonic(),
+                    "last_pcm":   None,        # last good PCM frame for PLC
+                    "plc_ticks":  0,           # consecutive ticks of PLC concealment
                 }
             state = self._senders[nick]
             state["last"] = time.monotonic()
@@ -1599,14 +1632,13 @@ class AudioEngine:
             if seq < 0 or state["next_seq"] < 0:
                 # No sequence info — append directly (legacy path)
                 state["buf"].append(pcm)
+                state["last_pcm"] = pcm
             else:
                 # Insert into the hold buffer sorted by seq
                 import bisect as _bisect
                 keys = [s for s, _ in state["hold"]]
                 pos  = _bisect.bisect_left(keys, seq)
                 state["hold"].insert(pos, (seq, pcm))
-                if len(state["hold"]) == 1:
-                    state["held_since"] = time.monotonic()
                 self._flush_hold(state)
 
     def _flush_hold(self, state: dict):
@@ -1616,27 +1648,39 @@ class AudioEngine:
 
         Release strategy:
           1. Contiguous from next_seq — emit all frames that arrive in order.
-          2. Deadline flush — if the oldest held frame has been waiting longer
-             than JITTER_WINDOW mixer ticks (i.e. the missing predecessor is
-             never going to arrive), skip over the gap and emit anyway.
+          2. Deadline flush — if the gap (missing predecessor) has been open
+             for longer than JITTER_WINDOW mixer ticks, skip over it and emit
+             the next available frame.  held_since tracks when the gap was
+             *first detected*, not when the hold-list head last changed.
         """
         deadline = self.JITTER_WINDOW * self.MIXER_TICK
         while state["hold"]:
             top_seq, top_pcm = state["hold"][0]
-            age = time.monotonic() - state["held_since"]
 
-            if top_seq == state["next_seq"] or age >= deadline:
-                # Either this is the frame we expected, or we've waited long
-                # enough — emit it and advance next_seq past any gap.
+            if top_seq == state["next_seq"]:
+                # Arrived in order (or gap closed) — emit immediately
                 state["hold"].pop(0)
                 state["buf"].append(top_pcm)
+                state["last_pcm"] = top_pcm
                 state["next_seq"] = top_seq + 1
-                # Update held_since for the new oldest frame
-                if state["hold"]:
-                    state["held_since"] = time.monotonic()
+                state["held_since"] = None   # gap resolved
             else:
-                # Gap still within the wait window — stop here
-                break
+                # There is a gap ahead of top_seq
+                now = time.monotonic()
+                if state["held_since"] is None:
+                    # First time we notice this gap — start the clock
+                    state["held_since"] = now
+                age = now - state["held_since"]
+                if age >= deadline:
+                    # Gap has been open too long — skip missing frames and emit
+                    state["hold"].pop(0)
+                    state["buf"].append(top_pcm)
+                    state["last_pcm"] = top_pcm
+                    state["next_seq"] = top_seq + 1
+                    state["held_since"] = None   # reset for next gap
+                else:
+                    # Still within the wait window — leave in hold
+                    break
 
     def stop(self):
         self._running = False
