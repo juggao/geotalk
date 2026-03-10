@@ -2431,7 +2431,18 @@ class GeoTalk:
         self.audio.release_ptt()
         return f"{DM}[PTT OFF]{R}"
 
-    def play_wav(self, path: str) -> str:
+    def mute_toggle(self) -> str:
+        """Toggle incoming audio mute on/off."""
+        if not AUDIO_AVAILABLE or not self.audio.pa:
+            return f"{YL}Audio not available.{R}"
+        if self.audio.is_muted:
+            self.audio.unmute()
+            return f"{DM}[MUTE OFF] Incoming audio unmuted.{R}"
+        else:
+            self.audio.mute()
+            return f"{YL}[MUTE ON] Incoming audio muted.{R}"
+
+
         """
         Read a WAV file and transmit it as audio on the active channel.
 
