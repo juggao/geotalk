@@ -1073,6 +1073,9 @@ class GeoTalkGUI:
                 marker = "► " if k == self.gt.active else "  "
                 display = ch.pattern.display()
                 users = ch.active_users()
+                # Include own nick in the count — own packets are not echoed back
+                if self.gt.nick and self.gt.nick not in users:
+                    users = [self.gt.nick] + users
                 ustr = f" ({len(users)})" if users else ""
                 self._chan_list.insert("end", f"{marker}#{display}{ustr}")
                 self._chan_keys.append(k)
@@ -1200,6 +1203,10 @@ class GeoTalkGUI:
             active_ch = self.gt.active or "—"
             ch = self.gt.channels.get(self.gt.active)
             users = ch.active_users() if ch else []
+            # Own nick is never echoed back to us, so add it explicitly
+            # (we are always present on any channel we have joined)
+            if self.gt.nick and self.gt.nick not in users:
+                users = [self.gt.nick] + users
             msgs = ch.msg_count if ch else 0
             ptt = "● PTT ON" if self.gt._ptt_held else ""
             try:
