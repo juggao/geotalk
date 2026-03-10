@@ -94,10 +94,10 @@ class _QueueWriter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COLOUR PALETTE  — amber CRT on near-black
+# COLOUR PALETTES  — dark (amber CRT) and light (clean white)
 # ══════════════════════════════════════════════════════════════════════════════
 
-P = {
+PALETTE_DARK = {
     "bg":         "#0d0e0f",      # near-black chassis
     "bg2":        "#111314",      # slightly lighter panel
     "bg3":        "#161819",      # input fields
@@ -126,6 +126,38 @@ P = {
     "rec_dim":    "#6a1a1a",      # REC button border idle
 }
 
+PALETTE_LIGHT = {
+    "bg":         "#f5f5f5",      # near-white chassis
+    "bg2":        "#ececec",      # slightly darker panel (sidebar)
+    "bg3":        "#ffffff",      # input fields
+    "amber":      "#1a6fbd",      # primary accent (blue replaces amber)
+    "amber_dim":  "#6b9ec7",      # dimmed accent
+    "amber_pale": "#0d4a8a",      # highlight (dark blue)
+    "green":      "#1a8c3e",      # online / active indicator
+    "red":        "#cc2020",      # PTT active / error
+    "red_dim":    "#c08080",      # PTT button idle
+    "blue":       "#1a6fbd",      # info / relay
+    "mute":       "#b08000",      # muted state
+    "border":     "#d0d0d0",      # subtle borders
+    "border2":    "#aaaaaa",      # active borders
+    "text":       "#222222",      # body text (dark)
+    "text_dim":   "#888888",      # de-emphasised
+    "text_hi":    "#000000",      # highlights
+    "ptt_bg":     "#f5f5f5",      # PTT button background
+    "ptt_active": "#dd1010",      # PTT on
+    "ptt_idle":   "#f0d8d8",      # PTT off (light red)
+    "scan":       "#0088aa",      # scan / info colour
+    "play_idle":  "#ddf0e4",      # PLAY button idle (light green)
+    "play_active":"#1a8c3e",      # PLAY button transmitting
+    "play_dim":   "#90c8a8",      # PLAY button border idle
+    "rec_idle":   "#f5e0e0",      # REC button idle (light red)
+    "rec_active": "#cc2020",      # REC button recording
+    "rec_dim":    "#d08080",      # REC button border idle
+}
+
+# Active palette — mutable, widgets read from this dict
+P = dict(PALETTE_DARK)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONNECT DIALOG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -150,6 +182,7 @@ _PREFS_DEFAULTS: dict = {
     "auto_channel": False,
     "join_active":  False,
     "window_geometry": "",
+    "theme":        "dark",
 }
 
 def _load_prefs() -> dict:
@@ -316,6 +349,7 @@ class GeoTalkGUI:
         self._rec_path  = ""          # output WAV path
         self._rec_wave  = None        # wave.Wave_write object
         self._rec_lock  = threading.Lock()  # guards _rec_wave writes
+        self._theme     = "dark"      # current theme: "dark" | "light"
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -338,6 +372,14 @@ class GeoTalkGUI:
             except Exception:
                 pass
 
+        # Restore saved theme (after UI is fully built)
+        saved_theme = self._prefs.get("theme", "dark")
+        if saved_theme == "light":
+            self._theme = "light"
+            P.update(PALETTE_LIGHT)
+            self._theme_btn.configure(text="☾")
+            self._apply_theme()
+
         # Show connect dialog after window appears
         root.after(120, self._show_connect)
 
@@ -350,6 +392,7 @@ class GeoTalkGUI:
         hdr = tk.Frame(root, bg=P["bg"], height=40)
         hdr.pack(fill="x", padx=0, pady=0)
         hdr.pack_propagate(False)
+        self._hdr = hdr
 
         self._hdr_left = tk.Label(hdr, text="◈ GEOTALK", bg=P["bg"],
                                   fg=P["amber"], font=("Courier", 13, "bold"))
@@ -363,17 +406,28 @@ class GeoTalkGUI:
                                    fg=P["amber_dim"], font=("Courier", 9))
         self._hdr_right.pack(side="right", padx=14)
 
+        # Theme toggle button — right side of header
+        self._theme_btn = tk.Button(
+            hdr, text="☀", font=("Courier", 12),
+            bg=P["bg"], fg=P["amber_dim"],
+            activebackground=P["bg2"], activeforeground=P["amber"],
+            relief="flat", cursor="hand2", bd=0,
+            command=self._toggle_theme)
+        self._theme_btn.pack(side="right", padx=(0, 4))
+
         # Separator
         tk.Frame(root, bg=P["border"], height=1).pack(fill="x")
 
         # ── Main body ─────────────────────────────────────────────────────────
         body = tk.Frame(root, bg=P["bg"])
         body.pack(fill="both", expand=True)
+        self._body = body
 
         # Left sidebar — channels
         sidebar = tk.Frame(body, bg=P["bg2"], width=190)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
+        self._sidebar = sidebar
 
         tk.Label(sidebar, text="CHANNELS", bg=P["bg2"], fg=P["amber_dim"],
                  font=("Courier", 8, "bold"), anchor="w").pack(
@@ -558,7 +612,139 @@ class GeoTalkGUI:
         t.tag_configure("chan_hdr", foreground=P["amber"],     font=("Courier", 11, "bold"))
         t.tag_configure("ping",     foreground=P["text_dim"],  font=("Courier", 9, "italic"))
 
-    # ── Key bindings ──────────────────────────────────────────────────────────
+    # ── Theme switching ───────────────────────────────────────────────────────
+
+    def _toggle_theme(self):
+        """Switch between dark and light themes."""
+        if self._theme == "dark":
+            self._theme = "light"
+            P.update(PALETTE_LIGHT)
+            self._theme_btn.configure(text="☾")
+        else:
+            self._theme = "dark"
+            P.update(PALETTE_DARK)
+            self._theme_btn.configure(text="☀")
+        self._prefs["theme"] = self._theme
+        _save_prefs(self._prefs)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """Repaint every widget to reflect the current palette P."""
+        # ── walk all widgets recursively ─────────────────────────────────────
+        def _recolour(w):
+            cls = w.winfo_class()
+            try:
+                if cls == "Frame":
+                    # Separator frames (1-px wide or tall) → border colour
+                    try:
+                        ww = w.winfo_width()
+                        wh = w.winfo_height()
+                    except Exception:
+                        ww = wh = 0
+                    if ww == 1 or wh == 1:
+                        w.configure(bg=P["border"])
+                    else:
+                        cur = w.cget("bg")
+                        if cur in (PALETTE_DARK["bg2"], PALETTE_LIGHT["bg2"]):
+                            w.configure(bg=P["bg2"])
+                        elif cur in (PALETTE_DARK["bg3"], PALETTE_LIGHT["bg3"]):
+                            w.configure(bg=P["bg3"])
+                        else:
+                            w.configure(bg=P["bg"])
+                elif cls == "Label":
+                    # Inherit bg from parent frame
+                    try:
+                        pbg = w.master.cget("bg")
+                        if pbg in (PALETTE_DARK["bg2"], PALETTE_LIGHT["bg2"],
+                                   P["bg2"]):
+                            w.configure(bg=P["bg2"])
+                        elif pbg in (PALETTE_DARK["bg3"], PALETTE_LIGHT["bg3"],
+                                     P["bg3"]):
+                            w.configure(bg=P["bg3"])
+                        else:
+                            w.configure(bg=P["bg"])
+                    except Exception:
+                        w.configure(bg=P["bg"])
+                elif cls == "Scrollbar":
+                    w.configure(bg=P["bg2"], troughcolor=P["bg"],
+                                activebackground=P["amber_dim"])
+            except Exception:
+                pass
+            for child in w.winfo_children():
+                _recolour(child)
+
+        _recolour(self.root)
+        self.root.configure(bg=P["bg"])
+
+        # ── named widgets that need precise colour treatment ──────────────────
+        self._hdr.configure(bg=P["bg"])
+        self._hdr_left.configure(bg=P["bg"], fg=P["amber"])
+        self._hdr_status.configure(bg=P["bg"])
+        self._hdr_right.configure(bg=P["bg"], fg=P["amber_dim"])
+        self._theme_btn.configure(
+            bg=P["bg"], fg=P["amber_dim"],
+            activebackground=P["bg2"], activeforeground=P["amber"])
+
+        self._sidebar.configure(bg=P["bg2"])
+        self._chan_list.configure(
+            bg=P["bg2"], fg=P["text"],
+            selectbackground=P["amber_dim"],
+            selectforeground=P["amber_pale"])
+
+        self._join_entry.configure(
+            bg=P["bg3"], fg=P["amber_pale"],
+            insertbackground=P["amber"],
+            highlightbackground=P["border"],
+            highlightcolor=P["amber"])
+
+        self._msg_text.configure(bg=P["bg"], fg=P["text"])
+        self._setup_tags()   # repaint all text tags
+
+        self._prompt_lbl.configure(bg=P["bg3"], fg=P["amber"])
+        self._repl_entry.configure(
+            bg=P["bg3"], fg=P["amber_pale"],
+            insertbackground=P["amber"])
+
+        # ── bottom bar buttons ────────────────────────────────────────────────
+        if self.gt and self.gt._ptt_held:
+            self._ptt_btn.configure(bg=P["ptt_active"], fg="white",
+                                    activebackground=P["ptt_active"])
+        else:
+            self._ptt_btn.configure(
+                bg=P["ptt_idle"], fg=P["red_dim"],
+                activebackground=P["ptt_active"])
+
+        self._mute_btn.configure(bg=P["bg2"], fg=P["text_dim"],
+                                 activebackground=P["mute"],
+                                 highlightbackground=P["border"])
+
+        if self._play_busy:
+            # keep active appearance — just update active colours
+            pass
+        else:
+            self._play_btn.configure(
+                bg=P["play_idle"], fg=P["green"],
+                activebackground=P["play_active"],
+                highlightbackground=P["play_dim"])
+
+        self._loop_chk.configure(
+            bg=P["bg"], fg=P["green"],
+            selectcolor=P["bg"],
+            activebackground=P["bg"], activeforeground=P["amber"])
+
+        if self._rec_busy:
+            pass   # keep active appearance
+        else:
+            self._rec_btn.configure(
+                bg=P["rec_idle"], fg=P["red"],
+                activebackground=P["rec_active"],
+                highlightbackground=P["rec_dim"])
+
+        self._status_line1.configure(bg=P["bg"], fg=P["text"])
+        self._status_line2.configure(bg=P["bg"], fg=P["text_dim"])
+        self._transport_lbl.configure(bg=P["bg"])
+
+
 
     def _bind_keys(self):
         self.root.bind("<space>",        self._ptt_key_down)
