@@ -2461,7 +2461,7 @@ class GeoTalk:
         """Return True if this specific channel is individually muted."""
         return key in self._muted_channels
 
-
+    def play_wav(self, path: str) -> str:
         """
         Read a WAV file and transmit it as audio on the active channel.
 
