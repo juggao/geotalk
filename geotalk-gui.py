@@ -403,8 +403,12 @@ class GeoTalkGUI:
                                     fg=P["text_dim"], font=("Courier", 9))
         self._hdr_status.pack(side="left", padx=6)
 
-        self._hdr_right = tk.Label(hdr, text="", bg=P["bg"],
-                                   fg=P["amber_dim"], font=("Courier", 9))
+        self._hdr_right = tk.Button(
+            hdr, text="", bg=P["bg"],
+            fg=P["amber_dim"], font=("Courier", 9),
+            activebackground=P["bg"], activeforeground=P["amber"],
+            relief="flat", bd=0, cursor="hand2",
+            command=self._show_about)
         self._hdr_right.pack(side="right", padx=14)
 
         # Theme toggle button — right side of header
@@ -692,7 +696,9 @@ class GeoTalkGUI:
         self._hdr.configure(bg=P["bg"])
         self._hdr_left.configure(bg=P["bg"], fg=P["amber"])
         self._hdr_status.configure(bg=P["bg"])
-        self._hdr_right.configure(bg=P["bg"], fg=P["amber_dim"])
+        self._hdr_right.configure(bg=P["bg"], fg=P["amber_dim"],
+                                  activebackground=P["bg"],
+                                  activeforeground=P["amber"])
         self._theme_btn.configure(
             bg=P["bg"], fg=P["amber_dim"],
             activebackground=P["bg2"], activeforeground=P["amber"])
@@ -802,6 +808,76 @@ class GeoTalkGUI:
             self._ptt_up(None)
 
     # ── Connect flow ──────────────────────────────────────────────────────────
+
+    def _show_about(self):
+        """Pop up a small About window."""
+        win = tk.Toplevel(self.root)
+        win.title("About GeoTalk")
+        win.configure(bg=P["bg"])
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        pad = 28
+
+        # Title
+        tk.Label(win, text="GeoTalk 📡", bg=P["bg"], fg=P["amber"],
+                 font=("Courier", 16, "bold")).pack(pady=(pad, 6), padx=pad)
+
+        # Subtitle
+        tk.Label(win,
+                 text="Pseudo-HAM Radio & Text Messaging\n"
+                      "Geo-grouped by Postal Code",
+                 bg=P["bg"], fg=P["amber_dim"],
+                 font=("Courier", 10, "italic"),
+                 justify="center").pack(padx=pad)
+
+        # Separator
+        tk.Frame(win, bg=P["border"], height=1).pack(fill="x",
+                                                      padx=pad, pady=14)
+
+        # Body text
+        body = (
+            "GeoTalk is a VoIP/Radio program that turns any postal code\n"
+            "into a radio channel. Users in the same postal zone share a\n"
+            "UDP group; voice (PTT) and text messages are broadcast to\n"
+            "everyone on that channel — like a local walkie-talkie net.\n\n"
+            "Works on a LAN via IP multicast, or across the internet\n"
+            "via a relay server."
+        )
+        tk.Label(win, text=body, bg=P["bg"], fg=P["text"],
+                 font=("Courier", 10), justify="left").pack(padx=pad)
+
+        # Separator
+        tk.Frame(win, bg=P["border"], height=1).pack(fill="x",
+                                                      padx=pad, pady=14)
+
+        # Maintainer
+        tk.Label(win,
+                 text="Maintainer:  René Oudeweg <roudeweg@gmail.com>",
+                 bg=P["bg"], fg=P["text_dim"],
+                 font=("Courier", 9)).pack(padx=pad)
+
+        # Version
+        tk.Label(win, text=f"v{gt_mod.VERSION}", bg=P["bg"],
+                 fg=P["amber_dim"],
+                 font=("Courier", 9)).pack(pady=(4, 0))
+
+        # Close button
+        tk.Button(win, text="Close", font=("Courier", 10, "bold"),
+                  bg=P["amber_dim"], fg=P["bg"],
+                  activebackground=P["amber"], activeforeground=P["bg"],
+                  relief="flat", cursor="hand2", padx=20,
+                  command=win.destroy).pack(pady=(18, pad))
+
+        # Centre over the main window
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx() + self.root.winfo_width() // 2
+        ry = self.root.winfo_rooty() + self.root.winfo_height() // 2
+        win.update_idletasks()
+        wx = rx - win.winfo_width() // 2
+        wy = ry - win.winfo_height() // 2
+        win.geometry(f"+{wx}+{wy}")
 
     def _show_connect(self):
         dlg = ConnectDialog(self.root, prefs=self._prefs)
