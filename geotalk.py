@@ -1026,6 +1026,18 @@ def decode_packet(data: bytes) -> dict | None:
         except Exception:
             return None
 
+    if ptype == PKT_JOIN:
+        try:
+            return {"type": "join", **json.loads(body[:plen])}
+        except Exception:
+            return None
+
+    if ptype == PKT_LEAVE:
+        try:
+            return {"type": "leave", **json.loads(body[:plen])}
+        except Exception:
+            return None
+
     return None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2781,6 +2793,45 @@ class GeoTalk:
 
         if nick == self.nick:
             return   # suppress own echo for other packet types
+
+        # ── LEAVE: remove the departing nick from all matching channels ────
+        if pkt_type == "leave":
+            ts = time.strftime("%H:%M")
+            if hint_key:
+                candidate_keys = [hint_key] if hint_key in self.channels else []
+            else:
+                candidate_keys = list(self.channels.keys())
+            for key in candidate_keys:
+                ch = self.channels.get(key)
+                if ch:
+                    ch.users.pop(nick, None)
+                    sys.stdout.write(
+                        f"\r{DM}{ts}{R} {DM}← {nick} left "
+                        f"#{ch.pattern.display()}{R}\n")
+                    sys.stdout.flush()
+                    self._redraw_prompt()
+            return
+
+        # ── JOIN: record the arriving nick in all matching channels ────────
+        if pkt_type == "join":
+            ts = time.strftime("%H:%M")
+            if hint_key:
+                candidate_keys = [hint_key] if hint_key in self.channels else []
+            else:
+                candidate_keys = list(self.channels.keys())
+            for key in candidate_keys:
+                ch = self.channels.get(key)
+                if ch and (pkt.get("p") == key or
+                           sender_postal == ch.pattern.source or
+                           (ch.pattern.kind not in ("exact", "freq") and
+                            ch.pattern.matches(sender_postal))):
+                    ch.seen(nick)
+                    sys.stdout.write(
+                        f"\r{DM}{ts}{R} {DM}→ {nick} joined "
+                        f"#{ch.pattern.display()}{R}\n")
+                    sys.stdout.flush()
+                    self._redraw_prompt()
+            return
 
         # Find which of our subscribed channels should receive this packet.
         # For multicast we already know the channel (hint_key).

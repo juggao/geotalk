@@ -959,6 +959,13 @@ class RelayDaemon:
             return
 
         if ptype == PKT_LEAVE:
+            # Fan out the LEAVE to all channels this client is on so that
+            # other subscribers can remove the nick from their user lists
+            # immediately — before we unsubscribe and lose the channel list.
+            client = self.registry._clients.get(addr)
+            if client:
+                for ch in list(client.channels):
+                    self._fanout(data, ch, exclude=addr)
             self.registry.unsubscribe_all(addr)
             line = f"-LEAVE {nick or addr[0]}"
             if not self.quiet:
