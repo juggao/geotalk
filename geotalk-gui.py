@@ -156,7 +156,7 @@ PALETTE_LIGHT = {
 }
 
 # Active palette — mutable, widgets read from this dict
-P = dict(PALETTE_DARK)
+P = dict(PALETTE_LIGHT)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONNECT DIALOG
@@ -182,7 +182,7 @@ _PREFS_DEFAULTS: dict = {
     "auto_channel": False,
     "join_active":  False,
     "window_geometry": "",
-    "theme":        "dark",
+    "theme":        "light",
 }
 
 def _load_prefs() -> dict:
@@ -349,7 +349,7 @@ class GeoTalkGUI:
         self._rec_path  = ""          # output WAV path
         self._rec_wave  = None        # wave.Wave_write object
         self._rec_lock  = threading.Lock()  # guards _rec_wave writes
-        self._theme     = "dark"      # current theme: "dark" | "light"
+        self._theme     = "light"     # current theme: "dark" | "light"
         self._mute_ch_var = None      # BooleanVar for channel-mute checkbox (set in _build_ui)
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
@@ -374,10 +374,14 @@ class GeoTalkGUI:
                 pass
 
         # Restore saved theme (after UI is fully built)
-        saved_theme = self._prefs.get("theme", "dark")
-        if saved_theme == "light":
-            self._theme = "light"
-            P.update(PALETTE_LIGHT)
+        saved_theme = self._prefs.get("theme", "light")
+        if saved_theme == "dark":
+            self._theme = "dark"
+            P.update(PALETTE_DARK)
+            self._theme_btn.configure(text="☀")
+            self._apply_theme()
+        else:
+            # Light is the default — button symbol already set, apply to ensure consistency
             self._theme_btn.configure(text="☾")
             self._apply_theme()
 
@@ -413,7 +417,7 @@ class GeoTalkGUI:
 
         # Theme toggle button — right side of header
         self._theme_btn = tk.Button(
-            hdr, text="☀", font=("Courier", 12),
+            hdr, text="☾", font=("Courier", 12),
             bg=P["bg"], fg=P["amber_dim"],
             activebackground=P["bg2"], activeforeground=P["amber"],
             relief="flat", cursor="hand2", bd=0,
