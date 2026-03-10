@@ -474,6 +474,26 @@ class GeoTalkGUI:
         tk.Label(chan_btn_f, text="#channel to join", bg=P["bg2"],
                  fg=P["text_dim"], font=("Courier", 7)).pack(anchor="w")
 
+        # Leave / Active button row
+        chan_action_f = tk.Frame(chan_btn_f, bg=P["bg2"])
+        chan_action_f.pack(fill="x", pady=(6, 0))
+
+        self._leave_btn = tk.Button(
+            chan_action_f, text="← Leave", font=("Courier", 8),
+            bg=P["bg2"], fg=P["red_dim"],
+            activebackground=P["red"], activeforeground="white",
+            relief="flat", cursor="hand2", bd=0,
+            command=self._on_leave_btn)
+        self._leave_btn.pack(side="left", fill="x", expand=True)
+
+        self._active_btn = tk.Button(
+            chan_action_f, text="⊕ Active", font=("Courier", 8),
+            bg=P["bg2"], fg=P["scan"],
+            activebackground=P["scan"], activeforeground=P["bg"],
+            relief="flat", cursor="hand2", bd=0,
+            command=self._on_active_btn)
+        self._active_btn.pack(side="left", fill="x", expand=True)
+
         # Vertical separator
         tk.Frame(body, bg=P["border"], width=1).pack(side="left", fill="y")
 
@@ -718,6 +738,13 @@ class GeoTalkGUI:
             insertbackground=P["amber"],
             highlightbackground=P["border"],
             highlightcolor=P["amber"])
+
+        self._leave_btn.configure(
+            bg=P["bg2"], fg=P["red_dim"],
+            activebackground=P["red"], activeforeground="white")
+        self._active_btn.configure(
+            bg=P["bg2"], fg=P["scan"],
+            activebackground=P["scan"], activeforeground=P["bg"])
 
         self._msg_text.configure(bg=P["bg"], fg=P["text"])
         self._setup_tags()   # repaint all text tags
@@ -1348,6 +1375,22 @@ class GeoTalkGUI:
         result = gt_mod.handle_command(chan, self.gt)
         if result:
             self._ingest_result(result)
+        self._refresh_channels()
+
+    def _on_leave_btn(self):
+        if not self.gt:
+            return
+        result = gt_mod.handle_command("/leave", self.gt)
+        if result:
+            self._ingest_result(strip_ansi(result))
+        self._refresh_channels()
+
+    def _on_active_btn(self):
+        if not self.gt:
+            return
+        result = gt_mod.handle_command("/active", self.gt)
+        if result:
+            self._ingest_result(strip_ansi(result))
         self._refresh_channels()
 
     def _on_chan_select(self, event):
