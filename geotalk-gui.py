@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-gui.py — GeoTalk Desktop GUI  v2.3.0
+geotalk-gui.py — GeoTalk Desktop GUI  v2.3.3
 A tkinter frontend for the GeoTalk radio-over-IP client.
 
 Layout
@@ -350,6 +350,7 @@ class GeoTalkGUI:
         self._rec_wave  = None        # wave.Wave_write object
         self._rec_lock  = threading.Lock()  # guards _rec_wave writes
         self._theme     = "dark"      # current theme: "dark" | "light"
+        self._mute_ch_var = None      # BooleanVar for channel-mute checkbox (set in _build_ui)
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -541,8 +542,19 @@ class GeoTalkGUI:
             activebackground=P["mute"], activeforeground=P["bg"],
             relief="flat", cursor="hand2",
             highlightthickness=1, highlightbackground=P["border"])
-        self._mute_btn.pack(side="left", fill="y", padx=(0, 8), pady=12)
+        self._mute_btn.pack(side="left", fill="y", padx=(0, 4), pady=12)
         self._mute_btn.configure(command=self._toggle_mute)
+
+        # Channel-mute checkbox — "Ch." ticks mute only the active channel
+        self._mute_ch_var = tk.BooleanVar(value=False)
+        self._mute_ch_chk = tk.Checkbutton(
+            bottom, text="Ch.", font=("Courier", 9),
+            variable=self._mute_ch_var,
+            bg=P["bg"], fg=P["text_dim"], selectcolor=P["bg"],
+            activebackground=P["bg"], activeforeground=P["mute"],
+            cursor="hand2", relief="flat", bd=0,
+            command=self._toggle_mute_ch)
+        self._mute_ch_chk.pack(side="left", fill="y", padx=(0, 10), pady=12)
 
         # PLAY button — browse for WAV file and transmit
         self._play_btn = tk.Button(
@@ -717,6 +729,12 @@ class GeoTalkGUI:
         self._mute_btn.configure(bg=P["bg2"], fg=P["text_dim"],
                                  activebackground=P["mute"],
                                  highlightbackground=P["border"])
+
+        if hasattr(self, "_mute_ch_chk"):
+            self._mute_ch_chk.configure(
+                bg=P["bg"], fg=P["text_dim"],
+                selectcolor=P["bg"],
+                activebackground=P["bg"], activeforeground=P["mute"])
 
         if self._play_busy:
             # keep active appearance — just update active colours
@@ -979,10 +997,39 @@ class GeoTalkGUI:
         if is_muted:
             self._mute_btn.configure(bg=P["mute"], fg=P["bg"],
                                      highlightbackground=P["mute"])
+            # All-mute supersedes any per-channel mute — uncheck Ch.
+            if self._mute_ch_var:
+                self._mute_ch_var.set(False)
         else:
             self._mute_btn.configure(bg=P["bg2"], fg=P["text_dim"],
                                      highlightbackground=P["border"])
         self._append_sys(strip_ansi(result or ""))
+
+    def _toggle_mute_ch(self):
+        """Checkbox handler: mute or unmute only the active channel."""
+        if not self.gt or not self.gt.active:
+            if self._mute_ch_var:
+                self._mute_ch_var.set(False)
+            return
+        key = self.gt.active
+        if self._mute_ch_var.get():
+            # If all-mute is on, turn it off first
+            if gt_mod.AUDIO_AVAILABLE and self.gt.audio.pa and self.gt.audio.is_muted:
+                self.gt.audio.unmute()
+                self._mute_btn.configure(bg=P["bg2"], fg=P["text_dim"],
+                                         highlightbackground=P["border"])
+            result = self.gt.mute_channel(key)
+        else:
+            result = self.gt.unmute_channel(key)
+        self._append_sys(strip_ansi(result or ""))
+
+    def _sync_mute_ch_checkbox(self):
+        """Sync the Ch. checkbox to the active channel's mute state."""
+        if not self._mute_ch_var or not self.gt or not self.gt.active:
+            if self._mute_ch_var:
+                self._mute_ch_var.set(False)
+            return
+        self._mute_ch_var.set(self.gt.is_channel_muted(self.gt.active))
 
     # ── WAV playback ──────────────────────────────────────────────────────────
 
@@ -1250,6 +1297,7 @@ class GeoTalkGUI:
         if self.gt.relay_mode and self.gt.active:
             self.gt.relay.send(
                 gt_mod.encode_bbs_req(self.gt.nick, self.gt.active))
+        self._sync_mute_ch_checkbox()
         self._refresh_channels()
 
     def _refresh_channels(self):

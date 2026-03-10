@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relay-cli.py — GeoTalk Relay CLI  v2.1.0
+geotalk-relay-cli.py — GeoTalk Relay CLI  v2.3.3
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Local control client for geotalk-relayd.  Connects to the
@@ -47,7 +47,7 @@ import shutil
 # CONSTANTS & DEFAULTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = "2.1.0"
+VERSION = "2.3.3"
 
 def _default_ctl_socket() -> str:
     run = os.environ.get("XDG_RUNTIME_DIR", "/tmp")

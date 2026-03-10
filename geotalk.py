@@ -53,7 +53,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "2.3.0"
+VERSION      = "2.3.3"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -2128,6 +2128,7 @@ class GeoTalk:
         self._rx_threads = {}     # key → Thread  (multicast RX)
         self._msg_id     = 0
         self._ptt_held   = False
+        self._muted_channels: set = set()   # channel keys muted individually
 
     @property
     def relay_mode(self) -> bool:
@@ -2441,6 +2442,24 @@ class GeoTalk:
         else:
             self.audio.mute()
             return f"{YL}[MUTE ON] Incoming audio muted.{R}"
+
+    def mute_channel(self, key: str) -> str:
+        """Mute audio from a specific channel (by channel key)."""
+        self._muted_channels.add(key)
+        ch = self.channels.get(key)
+        label = ch.pattern.display() if ch else key
+        return f"{YL}[MUTE CH] #{label} muted.{R}"
+
+    def unmute_channel(self, key: str) -> str:
+        """Unmute a previously channel-muted channel."""
+        self._muted_channels.discard(key)
+        ch = self.channels.get(key)
+        label = ch.pattern.display() if ch else key
+        return f"{DM}[MUTE CH OFF] #{label} unmuted.{R}"
+
+    def is_channel_muted(self, key: str) -> bool:
+        """Return True if this specific channel is individually muted."""
+        return key in self._muted_channels
 
 
         """
@@ -2980,6 +2999,8 @@ class GeoTalk:
         elif pkt["type"] == "audio":
             if self._ptt_held:
                 return   # we are transmitting — discard incoming audio from others
+            if pat.key in self._muted_channels:
+                return   # this channel is individually muted
             self.audio.feed_audio(pkt.get("audio", b""), nick=nick,
                                    codec=pkt.get("codec", "pcm"),
                                    seq=pkt.get("s", -1))

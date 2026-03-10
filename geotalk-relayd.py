@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relayd.py — GeoTalk Relay Daemon  v2.1.0
+geotalk-relayd.py — GeoTalk Relay Daemon  v2.3.3
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Drop-in replacement for geotalk-relay.py that runs as a proper
@@ -77,7 +77,7 @@ from collections import defaultdict, deque
 # VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "2.1.0"
+VERSION  = "2.3.3"
 MAGIC    = b"GT"
 BUF_SIZE = 65536
 
