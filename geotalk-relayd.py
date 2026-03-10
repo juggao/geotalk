@@ -111,6 +111,15 @@ PKT_NAMES = {
     PKT_ACTIVE_RSP: "ACTIVE_RSP",
 }
 
+# Active keep-alive probe timing:
+#   After PROBE_AFTER seconds of silence from a client, the relay sends a
+#   PKT_PING directly to that client.  If the client does not respond within
+#   PROBE_GRACE seconds (any inbound packet counts as a response), it is
+#   evicted.  These values are intentionally tight relative to the client's
+#   60 s heartbeat so that dead connections are detected within ~2 minutes.
+PROBE_AFTER = 90   # seconds of client silence before sending a probe ping
+PROBE_GRACE = 30   # seconds to wait for a probe response before evicting
+
 SYSTEM_CHANNELS: dict[str, str] = {
     "INFO":      ("Welcome to #INFO — relay information and announcements. "
                   "This channel is managed by the relay operator. "
@@ -208,7 +217,7 @@ class _RingLog:
 
 class Client:
     __slots__ = ("addr", "nick", "channels", "first_seen", "last_seen",
-                 "pkts_rx", "pkts_tx", "bytes_rx", "bytes_tx")
+                 "pkts_rx", "pkts_tx", "bytes_rx", "bytes_tx", "probe_sent")
 
     def __init__(self, addr: tuple, nick: str = ""):
         self.addr       = addr
@@ -220,9 +229,11 @@ class Client:
         self.pkts_tx    = 0
         self.bytes_rx   = 0
         self.bytes_tx   = 0
+        self.probe_sent = 0.0   # monotonic time of last unanswered probe, 0 = none
 
     def touch(self, nick: str = ""):
-        self.last_seen = time.time()
+        self.last_seen  = time.time()
+        self.probe_sent = 0.0   # any inbound packet cancels a pending probe
         if nick:
             self.nick = nick
 
@@ -373,6 +384,62 @@ class ClientRegistry:
                 for ch in list(c.channels):
                     self._channels[ch].discard(addr)
         return len(stale)
+
+    def probe_and_prune(self, sendto_fn) -> tuple[list, list]:
+        """
+        Active keep-alive pass.  Called from the prune loop.
+
+        Returns (probed, dropped) — lists of (addr, nick) tuples for logging.
+
+        Algorithm per client:
+          1. If last_seen > PROBE_AFTER ago AND no probe pending → send a
+             PKT_PING directly to the client and record probe_sent.
+          2. If probe_sent is set AND probe_sent > PROBE_GRACE ago → evict.
+             (The client has had PROBE_GRACE seconds to respond and has not.)
+          3. Passive backstop: if last_seen > ttl ago → evict regardless
+             (catches clients that somehow slipped through probe logic).
+        """
+        now     = time.time()
+        probed  = []
+        dropped = []
+
+        with self._lock:
+            for addr, c in list(self._clients.items()):
+                idle = now - c.last_seen
+
+                # ── evict: probe unanswered ────────────────────────────────
+                if c.probe_sent and (now - c.probe_sent) >= PROBE_GRACE:
+                    dropped.append((addr, c.nick))
+                    del self._clients[addr]
+                    for ch in list(c.channels):
+                        self._channels[ch].discard(addr)
+                    continue
+
+                # ── evict: passive TTL backstop ────────────────────────────
+                if idle >= self.ttl:
+                    dropped.append((addr, c.nick))
+                    del self._clients[addr]
+                    for ch in list(c.channels):
+                        self._channels[ch].discard(addr)
+                    continue
+
+                # ── probe: client has been silent long enough ──────────────
+                if idle >= PROBE_AFTER and not c.probe_sent:
+                    # Build a minimal PKT_PING addressed to one of the
+                    # client's channels so it can be decoded normally.
+                    channel = next(iter(c.channels), "")
+                    payload = json.dumps({
+                        "n":  "relay",
+                        "p":  channel,
+                        "ts": int(now),
+                    }).encode()
+                    pkt = (MAGIC + bytes([PKT_PING]) +
+                           struct.pack("!H", len(payload)) + payload)
+                    sendto_fn(pkt, addr)
+                    c.probe_sent = now
+                    probed.append((addr, c.nick))
+
+        return probed, dropped
 
     def client_count(self) -> int:
         with self._lock:
@@ -1029,12 +1096,19 @@ class RelayDaemon:
 
     def _prune_loop(self):
         while self._running:
-            time.sleep(30)
-            removed = self.registry.prune_stale()
+            time.sleep(15)
+            probed, dropped = self.registry.probe_and_prune(self._sendto)
             self.registry.prune_scan_sessions()
-            if removed and not self.quiet:
-                line = f"Pruned {removed} stale client(s)"
-                print(f"{DM}{_ts()}  {line}{R}")
+
+            for addr, nick in probed:
+                line = f"Probe sent → {nick} ({addr[0]}:{addr[1]})"
+                if not self.quiet:
+                    print(f"{DM}{_ts()}  {YL}{line}{R}")
+                self._log_line(line)
+
+            for addr, nick in dropped:
+                line = f"Dropped (no probe response): {nick} ({addr[0]}:{addr[1]})"
+                print(f"{DM}{_ts()}  {RD}{line}{R}")
                 self._log_line(line)
 
     # ── control socket server ─────────────────────────────────────────────────

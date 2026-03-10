@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-gui.py — GeoTalk Desktop GUI  v2.1.0
+geotalk-gui.py — GeoTalk Desktop GUI  v2.3.0
 A tkinter frontend for the GeoTalk radio-over-IP client.
 
 Layout
@@ -23,6 +23,7 @@ import queue
 import threading
 import time
 import re
+import wave
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import simpledialog, messagebox, filedialog
@@ -120,6 +121,9 @@ P = {
     "play_idle":  "#0e2a18",      # PLAY button idle (dark green)
     "play_active":"#20c040",      # PLAY button transmitting (bright green)
     "play_dim":   "#1a6030",      # PLAY button border idle
+    "rec_idle":   "#2a0a0a",      # REC button idle (dark red)
+    "rec_active": "#e03030",      # REC button recording (bright red)
+    "rec_dim":    "#6a1a1a",      # REC button border idle
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -218,7 +222,7 @@ class ConnectDialog(tk.Toplevel):
 
         p = self._prefs
         self._nick_e   = self._entry(frame, p.get("nick", ""))
-        self._relay_e  = self._entry(frame, p.get("relay", ""))
+        self._relay_e  = self._entry(frame, p.get("relay", "geotalk.net"))
         self._rport_e  = self._entry(frame, str(p.get("relay_port", 5073)), width=8)
         self._join_e   = self._entry(frame, p.get("join", ""))
         self._iface_e  = self._entry(frame, p.get("local_if", ""))
@@ -307,6 +311,11 @@ class GeoTalkGUI:
         self._ptt_pressed = False  # mouse/keyboard hold state
         self._ptt_release_id = None  # pending after() id for debounced key release
         self._play_busy = False       # True while WAV is being transmitted
+        self._play_loop_var = tk.BooleanVar(value=False)  # Loop checkbox state
+        self._rec_busy  = False       # True while recording incoming audio
+        self._rec_path  = ""          # output WAV path
+        self._rec_wave  = None        # wave.Wave_write object
+        self._rec_lock  = threading.Lock()  # guards _rec_wave writes
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -488,8 +497,27 @@ class GeoTalkGUI:
             activebackground=P["play_active"], activeforeground=P["bg"],
             relief="flat", cursor="hand2",
             highlightthickness=1, highlightbackground=P["play_dim"])
-        self._play_btn.pack(side="left", fill="y", padx=(0, 10), pady=12)
+        self._play_btn.pack(side="left", fill="y", padx=(0, 4), pady=12)
         self._play_btn.configure(command=self._play_clicked)
+
+        # Loop checkbox — sits immediately right of PLAY button
+        self._loop_chk = tk.Checkbutton(
+            bottom, text="Loop", font=("Courier", 9),
+            variable=self._play_loop_var,
+            bg=P["bg"], fg=P["green"], selectcolor=P["bg"],
+            activebackground=P["bg"], activeforeground=P["amber"],
+            cursor="hand2", relief="flat", bd=0)
+        self._loop_chk.pack(side="left", fill="y", padx=(0, 6), pady=12)
+
+        # REC button — record incoming audio to a WAV file
+        self._rec_btn = tk.Button(
+            bottom, text="⏺ REC", font=("Courier", 10, "bold"),
+            bg=P["rec_idle"], fg=P["red"],
+            activebackground=P["rec_active"], activeforeground="white",
+            relief="flat", cursor="hand2",
+            highlightthickness=1, highlightbackground=P["rec_dim"])
+        self._rec_btn.pack(side="left", fill="y", padx=(0, 10), pady=12)
+        self._rec_btn.configure(command=self._rec_clicked)
 
         # Divider
         tk.Frame(bottom, bg=P["border"], width=1).pack(side="left", fill="y", pady=8)
@@ -542,6 +570,10 @@ class GeoTalkGUI:
     def _ptt_key_down(self, event):
         if str(event.widget) == str(self._repl_entry):
             return   # don't intercept space in input box
+        # If a WAV loop is playing, space stops it instead of activating PTT.
+        if self._play_busy:
+            self._play_stop()
+            return
         # Cancel any pending debounced release — this KeyPress is auto-repeat,
         # not a genuine new press after a release.
         if self._ptt_release_id is not None:
@@ -597,6 +629,9 @@ class GeoTalkGUI:
             except Exception:
                 pass
             self.gt = None
+        # Stop any in-progress recording — the old audio object is gone
+        if self._rec_busy:
+            self._rec_stop()
 
         # Redirect stdout now (before the worker starts) so any early
         # GeoTalk prints are captured immediately.
@@ -767,8 +802,9 @@ class GeoTalkGUI:
 
     def _play_clicked(self):
         """Click handler for the PLAY button.
-        - If a file is already playing: stop it.
-        - Otherwise: open the file-browser popup and start playback.
+        - If a file is already playing/looping: stop it.
+        - Otherwise: open the file-browser popup and start playback
+          (looped if the Loop checkbox is checked).
         """
         if not self.gt:
             self._append_sys("[PLAY] Not connected.")
@@ -792,31 +828,41 @@ class GeoTalkGUI:
         if not path:
             return   # user cancelled
 
-        result = self.gt.play_wav(path)
+        loop = self._play_loop_var.get()
+        if loop:
+            result = self.gt.play_wav_loop(path)
+        else:
+            result = self.gt.play_wav(path)
         self._append_sys(strip_ansi(result))
 
         # If playback started successfully, monitor the thread for completion
         t = getattr(self.gt, "_play_thread", None)
         if t and t.is_alive():
-            self._play_set_busy(True)
+            self._play_set_busy(True, loop=loop)
             self._play_watch()
 
     def _play_stop(self):
-        """Stop an in-progress playback."""
+        """Stop an in-progress playback or loop."""
         if not self.gt:
             return
         result = self.gt.play_stop()
         self._append_sys(strip_ansi(result))
         self._play_set_busy(False)
 
-    def _play_set_busy(self, busy: bool):
-        """Update button appearance to reflect playing / idle state."""
+    def _play_set_busy(self, busy: bool, loop: bool = False):
+        """Update button appearance to reflect playing / looping / idle state."""
         self._play_busy = busy
         if busy:
-            self._play_btn.configure(
-                text="■ STOP",
-                bg=P["play_active"], fg=P["bg"],
-                highlightbackground=P["play_active"])
+            if loop or self._play_loop_var.get():
+                self._play_btn.configure(
+                    text="■ LOOP",
+                    bg=P["play_active"], fg=P["bg"],
+                    highlightbackground=P["play_active"])
+            else:
+                self._play_btn.configure(
+                    text="■ STOP",
+                    bg=P["play_active"], fg=P["bg"],
+                    highlightbackground=P["play_active"])
         else:
             self._play_btn.configure(
                 text="▶ PLAY",
@@ -830,6 +876,96 @@ class GeoTalkGUI:
             self.root.after(200, self._play_watch)
         else:
             self._play_set_busy(False)
+
+    # ── Audio recording ───────────────────────────────────────────────────────
+
+    def _rec_clicked(self):
+        """Click handler for the REC button.
+        - If already recording: stop.
+        - Otherwise: open a save-file dialog and start recording.
+        """
+        if self._rec_busy:
+            self._rec_stop()
+        else:
+            self._rec_browse()
+
+    def _rec_browse(self):
+        """Open a save-file dialog, then start recording incoming audio."""
+        if not self.gt:
+            self._append_sys("[REC] Not connected.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save incoming audio as…",
+            defaultextension=".wav",
+            filetypes=[
+                ("WAV audio", "*.wav *.WAV"),
+                ("All files", "*.*"),
+            ],
+            initialdir=os.path.expanduser("~"),
+            initialfile="geotalk-record.wav",
+        )
+        if not path:
+            return   # user cancelled
+        self._rec_start(path)
+
+    def _rec_start(self, path: str):
+        """Open the WAV file and register the recording callback."""
+        try:
+            wf = wave.open(path, "wb")
+            wf.setnchannels(1)
+            wf.setsampwidth(2)          # 16-bit PCM
+            wf.setframerate(48000)
+        except Exception as e:
+            self._append_sys(f"[REC] Cannot open file: {e}")
+            return
+
+        with self._rec_lock:
+            self._rec_wave = wf
+            self._rec_path = path
+
+        # Register callback — called from feed_audio() thread with raw PCM
+        def _cb(pcm: bytes):
+            with self._rec_lock:
+                if self._rec_wave:
+                    try:
+                        self._rec_wave.writeframes(pcm)
+                    except Exception:
+                        pass
+
+        if self.gt and self.gt.audio:
+            self.gt.audio.set_record_callback(_cb)
+
+        self._rec_busy = True
+        self._rec_btn.configure(
+            text="⏹ STOP",
+            bg=P["rec_active"], fg="white",
+            highlightbackground=P["rec_active"])
+        self._append_sys(
+            f"[REC] Recording to {os.path.basename(path)} — press REC to stop")
+
+    def _rec_stop(self):
+        """Stop recording and close the WAV file."""
+        if self.gt and self.gt.audio:
+            self.gt.audio.clear_record_callback()
+
+        with self._rec_lock:
+            wf = self._rec_wave
+            self._rec_wave = None
+
+        if wf:
+            try:
+                wf.close()
+            except Exception:
+                pass
+
+        self._rec_busy = False
+        self._rec_btn.configure(
+            text="⏺ REC",
+            bg=P["rec_idle"], fg=P["red"],
+            highlightbackground=P["rec_dim"])
+        name = os.path.basename(self._rec_path) if self._rec_path else "?"
+        self._append_sys(f"[REC] Saved → {name}")
 
     # ── REPL ──────────────────────────────────────────────────────────────────
 

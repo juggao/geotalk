@@ -27,6 +27,12 @@ import argparse
 import hashlib
 import readline
 import signal
+import wave
+try:
+    import audioop as _audioop   # available up to Python 3.12
+    _HAVE_AUDIOOP = True
+except ImportError:
+    _HAVE_AUDIOOP = False        # Python 3.13+ — use pure-Python fallbacks below
 from datetime import datetime
 from collections import defaultdict
 
@@ -47,7 +53,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "2.0.0"
+VERSION      = "2.3.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -861,6 +867,46 @@ def encode_text(nick: str, postal: str, text: str, msg_id: int = 0) -> bytes:
                           "ts": int(time.time())}).encode()
     return MAGIC + bytes([PKT_TEXT]) + struct.pack("!H", len(payload)) + payload
 
+def _pcm_stereo_to_mono(data: bytes) -> bytes:
+    """Mix stereo int16-LE down to mono. Pure-Python fallback for audioop.tomono."""
+    if _HAVE_AUDIOOP:
+        return _audioop.tomono(data, 2, 0.5, 0.5)
+    out = bytearray(len(data) // 2)
+    for i in range(0, len(data) - 3, 4):
+        l = struct.unpack_from("<h", data, i)[0]
+        r = struct.unpack_from("<h", data, i + 2)[0]
+        m = max(-32768, min(32767, (l + r) >> 1))
+        struct.pack_into("<h", out, i >> 1, m)
+    return bytes(out)
+
+
+def _pcm_resample(data: bytes, src_rate: int, dst_rate: int,
+                  state=None) -> tuple:
+    """
+    Resample mono int16-LE PCM from src_rate to dst_rate.
+    Returns (resampled_bytes, new_state).
+    Uses audioop.ratecv when available, otherwise linear interpolation.
+    """
+    if _HAVE_AUDIOOP:
+        return _audioop.ratecv(data, 2, 1, src_rate, dst_rate, state)
+    if src_rate == dst_rate:
+        return (data, state)
+    n_src = len(data) // 2
+    n_dst = int(n_src * dst_rate / src_rate)
+    if n_dst == 0:
+        return (b"", state)
+    src = struct.unpack(f"<{n_src}h", data)
+    out = []
+    for i in range(n_dst):
+        pos = i * src_rate / dst_rate
+        lo  = int(pos)
+        hi  = min(lo + 1, n_src - 1)
+        frac = pos - lo
+        s   = int(src[lo] * (1 - frac) + src[hi] * frac)
+        out.append(max(-32768, min(32767, s)))
+    return (struct.pack(f"<{n_dst}h", *out), state)
+
+
 def encode_audio(nick: str, postal: str, seq: int, audio: bytes,
                  codec: str = "opus") -> bytes:
     # codec: "opus" (compressed) or "pcm" (raw int16 LE fallback)
@@ -1319,6 +1365,9 @@ class AudioEngine:
     SENDER_TIMEOUT     = 2.0
     # Mixer tick interval — should match one frame period
     MIXER_TICK         = AUDIO_CHUNK / AUDIO_RATE   # ~0.020 s at 48 kHz
+    # Jitter buffer: hold up to this many frames waiting for out-of-order seq
+    # before releasing.  3 frames = ~60 ms — enough for typical internet jitter.
+    JITTER_WINDOW      = 3
 
     def __init__(self):
         self.pa          = None
@@ -1329,8 +1378,9 @@ class AudioEngine:
         self._running    = False
         self._tx_cb      = None   # called with (audio_bytes, seq)
         self._seq        = 0
+        self._record_cb  = None   # called with decoded PCM bytes for each RX frame
 
-        # Per-sender state  {nick: {"buf": deque[pcm_bytes], "last": float}}
+        # Per-sender state — see feed_audio() for field descriptions
         self._senders: dict[str, dict] = {}
         self._sender_lock = threading.Lock()
 
@@ -1479,11 +1529,29 @@ class AudioEngine:
     def is_muted(self) -> bool:
         return self._muted
 
-    def feed_audio(self, audio: bytes, nick: str = "", codec: str = "pcm"):
+    def set_record_callback(self, fn):
+        """Register a callable(pcm_bytes) that receives every decoded
+        incoming audio frame.  Called from the feed_audio thread — the
+        callable must be fast and non-blocking (e.g. put to a queue)."""
+        self._record_cb = fn
+
+    def clear_record_callback(self):
+        """Remove the recording callback."""
+        self._record_cb = None
+
+    def feed_audio(self, audio: bytes, nick: str = "",
+                   codec: str = "pcm", seq: int = -1):
         """
-        Deliver an audio frame from `nick` into that sender's PCM ring buffer.
-        Opus frames are decoded to raw int16 PCM before buffering so the mixer
-        always works with PCM regardless of the sender's codec.
+        Deliver an audio frame from `nick` into the per-sender jitter buffer.
+
+        Frames are held in a small sorted window (JITTER_WINDOW frames) so
+        that UDP reordering is corrected before the frame reaches the mixer.
+        Opus frames are decoded to raw int16 PCM before buffering so the
+        mixer always works with uniform PCM regardless of the sender's codec.
+
+        `seq` is the sender's monotonic packet sequence number (field "s" in
+        the wire header).  Pass -1 (default) to bypass sequencing and append
+        directly — used for legacy peers that omit the field.
         """
         if self._muted:
             return
@@ -1497,15 +1565,66 @@ class AudioEngine:
                 return   # drop corrupted frame rather than pass noise to mixer
         else:
             pcm = audio  # raw PCM (legacy peer or opuslib not installed)
+        # Deliver decoded PCM to the recording callback (if active)
+        cb = self._record_cb
+        if cb:
+            try:
+                cb(pcm)
+            except Exception:
+                pass
         with self._sender_lock:
             if nick not in self._senders:
                 self._senders[nick] = {
-                    "buf":  collections.deque(maxlen=self.SENDER_QUEUE_DEPTH),
-                    "last": time.monotonic(),
+                    "buf":        collections.deque(maxlen=self.SENDER_QUEUE_DEPTH),
+                    "hold":       [],          # list of (seq, pcm) waiting to be ordered
+                    "next_seq":   seq,         # next seq we expect to emit
+                    "held_since": time.monotonic(),
+                    "last":       time.monotonic(),
                 }
             state = self._senders[nick]
-            state["buf"].append(pcm)
             state["last"] = time.monotonic()
+
+            if seq < 0 or state["next_seq"] < 0:
+                # No sequence info — append directly (legacy path)
+                state["buf"].append(pcm)
+            else:
+                # Insert into the hold buffer sorted by seq
+                import bisect as _bisect
+                keys = [s for s, _ in state["hold"]]
+                pos  = _bisect.bisect_left(keys, seq)
+                state["hold"].insert(pos, (seq, pcm))
+                if len(state["hold"]) == 1:
+                    state["held_since"] = time.monotonic()
+                self._flush_hold(state)
+
+    def _flush_hold(self, state: dict):
+        """
+        Release frames from the jitter hold buffer into the playback deque.
+        Called with self._sender_lock held.
+
+        Release strategy:
+          1. Contiguous from next_seq — emit all frames that arrive in order.
+          2. Deadline flush — if the oldest held frame has been waiting longer
+             than JITTER_WINDOW mixer ticks (i.e. the missing predecessor is
+             never going to arrive), skip over the gap and emit anyway.
+        """
+        deadline = self.JITTER_WINDOW * self.MIXER_TICK
+        while state["hold"]:
+            top_seq, top_pcm = state["hold"][0]
+            age = time.monotonic() - state["held_since"]
+
+            if top_seq == state["next_seq"] or age >= deadline:
+                # Either this is the frame we expected, or we've waited long
+                # enough — emit it and advance next_seq past any gap.
+                state["hold"].pop(0)
+                state["buf"].append(top_pcm)
+                state["next_seq"] = top_seq + 1
+                # Update held_since for the new oldest frame
+                if state["hold"]:
+                    state["held_since"] = time.monotonic()
+            else:
+                # Gap still within the wait window — stop here
+                break
 
     def stop(self):
         self._running = False
@@ -2300,7 +2419,218 @@ class GeoTalk:
         self.audio.release_ptt()
         return f"{DM}[PTT OFF]{R}"
 
-    def mute_toggle(self) -> str:
+    def play_wav(self, path: str) -> str:
+        """
+        Read a WAV file and transmit it as audio on the active channel.
+
+        Accepted formats
+        ────────────────
+        • 16-bit PCM, mono or stereo, **48 kHz only**.
+          Files at any other sample rate are rejected with a clear ffmpeg
+          conversion hint.  Stereo is downmixed to mono before encoding.
+        • A second /play call while one is already running is rejected.
+        """
+        if not self.active:
+            return f"{RD}No active channel.{R}"
+        if not AUDIO_AVAILABLE or not self.audio.pa:
+            return f"{YL}[PLAY] pyaudio not available — audio disabled.{R}"
+        if not self.audio._opus_enc and not self.audio._running:
+            return f"{YL}[PLAY] Audio engine not started.{R}"
+        if getattr(self, "_play_thread", None) and self._play_thread.is_alive():
+            return f"{YL}[PLAY] Already playing — wait for it to finish or use /play stop.{R}"
+
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            return f"{RD}[PLAY] File not found: {path!r}{R}"
+
+        # ── validate WAV header ───────────────────────────────────────────
+        try:
+            wf = wave.open(path, "rb")
+        except wave.Error as e:
+            return f"{RD}[PLAY] Cannot open WAV: {e}{R}"
+        except Exception as e:
+            return f"{RD}[PLAY] {e}{R}"
+
+        nchannels  = wf.getnchannels()
+        sampwidth  = wf.getsampwidth()   # bytes: 1=8-bit, 2=16-bit, 4=32-bit
+        framerate  = wf.getframerate()
+        nframes    = wf.getnframes()
+        wf.close()
+
+        if sampwidth != 2:
+            return (f"{RD}[PLAY] Unsupported sample width: {sampwidth * 8}-bit. "
+                    f"Please convert to 16-bit PCM (e.g. ffmpeg -ar 48000 -ac 1 "
+                    f"-sample_fmt s16 -f wav out.wav){R}")
+        if nchannels not in (1, 2):
+            return f"{RD}[PLAY] Unsupported channel count: {nchannels} (mono or stereo only){R}"
+        if framerate != AUDIO_RATE:
+            return (f"{RD}[PLAY] Sample rate must be {AUDIO_RATE // 1000} kHz — "
+                    f"file is {framerate} Hz. "
+                    f"Convert with: ffmpeg -i input.wav -ar {AUDIO_RATE} -ac 1 "
+                    f"-sample_fmt s16 output.wav{R}")
+
+        duration = nframes / framerate
+        codec    = self.audio.codec
+
+        # ── start background TX thread ────────────────────────────────────
+        self._play_stop = threading.Event()
+
+        def _tx():
+            try:
+                wf2 = wave.open(path, "rb")
+                seq = self.audio._seq
+
+                while not self._play_stop.is_set():
+                    raw = wf2.readframes(AUDIO_CHUNK)
+                    if not raw:
+                        break   # EOF
+
+                    pcm = raw
+
+                    # Stereo → mono
+                    if nchannels == 2:
+                        pcm = _pcm_stereo_to_mono(pcm)
+
+                    # Pad last frame with silence so Opus always gets 960 samples
+                    want = AUDIO_CHUNK * 2   # 2 bytes per int16 sample
+                    if len(pcm) < want:
+                        pcm += b"\x00" * (want - len(pcm))
+                    pcm = pcm[:want]
+
+                    # Encode and transmit
+                    if self.audio._opus_enc:
+                        try:
+                            audio = self.audio._opus_enc.encode(pcm, AUDIO_CHUNK)
+                        except Exception:
+                            audio = pcm
+                    else:
+                        audio = pcm
+
+                    self.send_audio_chunk(audio, seq)
+                    seq += 1
+                    self.audio._seq = seq
+
+                    # Pace transmission to real-time (20 ms per frame)
+                    time.sleep(AUDIO_CHUNK / AUDIO_RATE)
+
+                wf2.close()
+            except Exception as e:
+                sys.stdout.write(f"\r{RD}[PLAY] Error during playback: {e}{R}\n")
+                sys.stdout.flush()
+
+        self._play_thread = threading.Thread(target=_tx, daemon=True, name="play-wav")
+        self._play_thread.start()
+
+        ch_note = "" if nchannels == 1 else " (stereo→mono)"
+        return (f"{GR}[PLAY]{R} Transmitting {os.path.basename(path)}"
+                f"  {DM}{duration:.1f}s · {codec}{ch_note}{R}")
+
+    def play_stop(self) -> str:
+        """Abort an in-progress /play."""
+        ev = getattr(self, "_play_stop", None)
+        t  = getattr(self, "_play_thread", None)
+        if ev and t and t.is_alive():
+            ev.set()
+            return f"{YL}[PLAY] Stopping playback…{R}"
+        return f"{DM}[PLAY] Nothing playing.{R}"
+
+    def play_wav_loop(self, path: str) -> str:
+        """
+        Like play_wav() but loops continuously until play_stop() is called
+        or the /play stop command is issued.
+        """
+        if not self.active:
+            return f"{RD}No active channel.{R}"
+        if not AUDIO_AVAILABLE or not self.audio.pa:
+            return f"{YL}[PLAY] pyaudio not available — audio disabled.{R}"
+        if not self.audio._opus_enc and not self.audio._running:
+            return f"{YL}[PLAY] Audio engine not started.{R}"
+        if getattr(self, "_play_thread", None) and self._play_thread.is_alive():
+            return f"{YL}[PLAY] Already playing — use /play stop first.{R}"
+
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            return f"{RD}[PLAY] File not found: {path!r}{R}"
+
+        # ── validate WAV header ───────────────────────────────────────────
+        try:
+            wf = wave.open(path, "rb")
+        except wave.Error as e:
+            return f"{RD}[PLAY] Cannot open WAV: {e}{R}"
+        except Exception as e:
+            return f"{RD}[PLAY] {e}{R}"
+
+        nchannels  = wf.getnchannels()
+        sampwidth  = wf.getsampwidth()
+        framerate  = wf.getframerate()
+        nframes    = wf.getnframes()
+        wf.close()
+
+        if sampwidth != 2:
+            return (f"{RD}[PLAY] Unsupported sample width: {sampwidth * 8}-bit. "
+                    f"Please convert to 16-bit PCM (e.g. ffmpeg -ar 48000 -ac 1 "
+                    f"-sample_fmt s16 -f wav out.wav){R}")
+        if nchannels not in (1, 2):
+            return f"{RD}[PLAY] Unsupported channel count: {nchannels} (mono or stereo only){R}"
+        if framerate != AUDIO_RATE:
+            return (f"{RD}[PLAY] Sample rate must be {AUDIO_RATE // 1000} kHz — "
+                    f"file is {framerate} Hz. "
+                    f"Convert with: ffmpeg -i input.wav -ar {AUDIO_RATE} -ac 1 "
+                    f"-sample_fmt s16 output.wav{R}")
+
+        duration = nframes / framerate
+        codec    = self.audio.codec
+
+        # ── start looping TX thread ───────────────────────────────────────
+        self._play_stop = threading.Event()
+
+        def _tx():
+            try:
+                seq = self.audio._seq
+                while not self._play_stop.is_set():
+                    wf2 = wave.open(path, "rb")
+                    while not self._play_stop.is_set():
+                        raw = wf2.readframes(AUDIO_CHUNK)
+                        if not raw:
+                            break   # EOF — restart loop
+
+                        pcm = raw
+                        if nchannels == 2:
+                            pcm = _pcm_stereo_to_mono(pcm)
+
+                        want = AUDIO_CHUNK * 2
+                        if len(pcm) < want:
+                            pcm += b"\x00" * (want - len(pcm))
+                        pcm = pcm[:want]
+
+                        if self.audio._opus_enc:
+                            try:
+                                audio = self.audio._opus_enc.encode(pcm, AUDIO_CHUNK)
+                            except Exception:
+                                audio = pcm
+                        else:
+                            audio = pcm
+
+                        self.send_audio_chunk(audio, seq)
+                        seq += 1
+                        self.audio._seq = seq
+
+                        time.sleep(AUDIO_CHUNK / AUDIO_RATE)
+
+                    wf2.close()
+            except Exception as e:
+                sys.stdout.write(f"\r{RD}[PLAY] Error during loop playback: {e}{R}\n")
+                sys.stdout.flush()
+
+        self._play_thread = threading.Thread(target=_tx, daemon=True, name="play-wav-loop")
+        self._play_thread.start()
+
+        ch_note = "" if nchannels == 1 else " (stereo→mono)"
+        return (f"{GR}[PLAY-LOOP]{R} Looping {os.path.basename(path)}"
+                f"  {DM}{duration:.1f}s/loop · {codec}{ch_note}  "
+                f"[/play stop or Space to stop]{R}")
+
+
         if not AUDIO_AVAILABLE or not self.audio.pa:
             return f"{YL}[MUTE] Audio unavailable.{R}"
         if self.audio.is_muted:
@@ -2589,7 +2919,8 @@ class GeoTalk:
             if self._ptt_held:
                 return   # we are transmitting — discard incoming audio from others
             self.audio.feed_audio(pkt.get("audio", b""), nick=nick,
-                                   codec=pkt.get("codec", "pcm"))
+                                   codec=pkt.get("codec", "pcm"),
+                                   seq=pkt.get("s", -1))
             if not self.audio.is_muted:
                 sys.stdout.write(
                     f"\r{DM}{ts}{R} {MG}[VOICE]{R} "
@@ -2816,6 +3147,10 @@ HELP_TEXT = f"""
   {YL}Ctrl+T{R}            Toggle PTT on/off
   {YL}Ctrl+Y{R}            Toggle audio mute on/off
   {YL}/mute{R}  {YL}/m{R}          Toggle incoming audio mute
+  {YL}/play FILE{R}         Transmit a WAV file on the active channel
+                    16-bit PCM, 48 kHz, mono or stereo
+  {YL}/play-loop FILE{R}    Loop a WAV file continuously until stopped
+  {YL}/play stop{R}         Stop an in-progress WAV transmission or loop
 
 {B}Info{R}
   {YL}/users{R}             Active users on current channel
@@ -3015,6 +3350,22 @@ def handle_command(cmd: str, gt: GeoTalk) -> str | None:
                 return gt.ptt_release()
             return f"{YL}Usage: /ptt [on|off]{R}"
 
+        if cmd0 == "play":
+            if len(parts) < 2:
+                return f"{YL}Usage: /play <path/file.wav>  |  /play stop{R}"
+            arg = parts[1]
+            if arg.lower() == "stop":
+                return gt.play_stop()
+            # Rejoin in case path contains spaces
+            filepath = " ".join(parts[1:])
+            return gt.play_wav(filepath)
+
+        if cmd0 == "play-loop":
+            if len(parts) < 2:
+                return f"{YL}Usage: /play-loop <path/file.wav>{R}"
+            filepath = " ".join(parts[1:])
+            return gt.play_wav_loop(filepath)
+
         if cmd0 in ("mute", "m"):
             return gt.mute_toggle()
 
@@ -3199,37 +3550,53 @@ def _best_auto_channel(postal: str) -> str:
     Given a raw postal code from IP geolocation, return the most useful
     GeoTalk channel glob to auto-join.
 
-    Walks the entire DB and picks the entry with the longest fixed prefix
-    that still matches the postal code — i.e. the most specific region.
-    Falls back to a 3-char prefix glob, then the raw code as exact channel.
+    Walks the DB and picks the bare-digit pattern (e.g. "59**", "596**")
+    with the longest fixed prefix that matches the postal code, then returns
+    that pattern directly — so the wildcard suffix is exactly what the DB
+    defines, not a hardcoded "**".
+
+    Falls back to a computed prefix glob, then the raw code as exact channel.
     """
     if not postal:
         return ""
     postal_norm = postal.strip().upper()
+    # Strip trailing letters (NL: "5921 AB" → "5921", DE: "40210" stays)
+    # Channel patterns only cover the numeric part.
+    numeric_norm = "".join(c for c in postal_norm if c.isdigit())
 
     best_prefix = ""
+    best_pat    = ""
     for db_pat, cc, label in _GEO_REGIONS:
+        # Skip full-postcode patterns (ending in ??) — we want the bare-digit
+        # glob (e.g. "592*") not the full-code variant ("592*??").
+        if db_pat.endswith("??"):
+            continue
         prefix = db_pat.rstrip("?*")
         if not prefix:
             continue
-        # Only consider entries whose fixed prefix matches the start of postal
-        if not postal_norm.startswith(prefix):
+        if not numeric_norm.startswith(prefix):
             continue
         try:
             pat = ChannelPattern(db_pat.replace("?", "*"))
-            if pat.matches(postal_norm) and len(prefix) > len(best_prefix):
+            if pat.matches(numeric_norm) and len(prefix) > len(best_prefix):
                 best_prefix = prefix
+                best_pat    = db_pat   # already carries the correct * suffix
         except ValueError:
             pass
 
-    if best_prefix:
-        return best_prefix + "**"
+    if best_pat:
+        return best_pat
 
-    # Fall back to 3-char prefix glob
-    if len(postal_norm) >= 3:
-        return postal_norm[:3] + "**"
+    # Fallback: build a glob from the postal code's leading digits.
+    # Use the first 2 digits as a fixed prefix, then one * per remaining
+    # digit (so a 4-digit code "5921" → "59**", a 3-digit fragment "592" → "59*").
+    if len(numeric_norm) >= 2:
+        prefix    = numeric_norm[:2]
+        remaining = len(numeric_norm) - 2
+        stars     = "*" * remaining if remaining > 0 else "*"
+        return prefix + stars
 
-    return postal_norm
+    return numeric_norm if numeric_norm else postal_norm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3336,7 +3703,7 @@ Examples:
                              "e.g. --local-if 192.168.178.164")
     parser.add_argument("--debug",      action="store_true",
                         help="Print verbose multicast debug lines to stderr")
-    parser.add_argument("--relay",      default="", metavar="HOST",
+    parser.add_argument("--relay",      default="geotalk.net", metavar="HOST",
                         help="Relay server hostname or IP (enables relay mode)")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_PORT,
                         metavar="PORT",

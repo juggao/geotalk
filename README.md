@@ -36,6 +36,10 @@ via a relay server.
 | 📡 | Active channel list | `/active` queries the relay for all channels that currently have subscribers — shows nicks, user count, and region |
 | 🔗 | Join-active startup | `--join-active` queries the relay on startup and immediately joins every channel that has at least one user |
 | 🚨 | System channels | Relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS messages. `#INFO` and `#EMERGENCY` are joined automatically on relay startup; `#TEST` is not. Client BBS posts to system channels are rejected |
+| 🔁 | WAV loop playback | `/play-loop file.wav` transmits a WAV file on repeat until stopped — GUI has a **Loop** checkbox next to the PLAY button |
+| ⏺ | Incoming audio recording | GUI **REC** button records all incoming audio to a WAV file in real time — opens a save-file dialog; stop by pressing REC again |
+| 🩺 | Active keep-alive probing | Relay actively probes silent clients with a ping after 90 s of inactivity; drops them within 30 s if unanswered — no more zombie subscriptions |
+| 🔀 | UDP jitter buffer | Incoming audio frames are held in a short reorder window (~60 ms) before playback, correcting UDP out-of-order delivery without audible latency |
 
 ---
 
@@ -170,7 +174,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.1.0 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.3.0 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
@@ -179,9 +183,8 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 │              │ ➤  /scan 59**_                                      │
 │ [join entry] │                                                     │
 ├──────────────┴──────────────────────────────────────────────────────┤
-│  ● PTT   ◉ MUTE │  CH: #59**   users: CHARLIE, BOB   msgs: 7      │
-│                  │  country: NL   2 channels              LAN MCAST │
-└──────────────────────────────────────────────────────────────────────┘
+│  ● PTT  ◉ MUTE  ▶ PLAY  ☐ Loop  ⏺ REC │ CH: #59**  users: 2     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Channels sidebar** — lists all joined channels with active user count. Click any
@@ -196,6 +199,18 @@ timestamped `[NICK] (region) #channel: body` format.
 
 **PTT button** — large push-and-hold button. Hold to transmit, release to stop.
 
+**PLAY button** — opens a file browser to select a WAV file and transmit it on the
+active channel. While transmitting the button reads **■ STOP** — click again to abort.
+
+**Loop checkbox** — when checked, the selected WAV file repeats continuously. The
+button reads **■ LOOP** while active. Press Space (outside the REPL) or click the
+button again to stop the loop.
+
+**REC button** — opens a save-file dialog, then records all incoming audio to a
+16-bit / 48 kHz mono WAV file in real time. The button reads **⏹ STOP** while
+recording. Click again to stop and close the file. Recording also stops automatically
+if you disconnect or reconnect.
+
 **Status bar** — shows active channel, online users, message count, PTT/mute state,
 country, channel count, and transport mode (LAN MCAST or RELAY).
 
@@ -203,7 +218,7 @@ country, channel count, and transport mode (LAN MCAST or RELAY).
 
 | Key | Action |
 |---|---|
-| `Space` (outside REPL) | PTT push-to-talk (hold) |
+| `Space` (outside REPL) | PTT push-to-talk (hold) — or stop a playing loop if one is active |
 | `Ctrl+T` | Toggle PTT on/off |
 | `Ctrl+M` | Toggle audio mute |
 | `↑` / `↓` in REPL | Navigate command history |
@@ -601,7 +616,15 @@ python3 geotalk-relay-cli.py --socket /run/geotalk/relay.sock
 | `ACTIVE_REQ` (0x15) | **Unicast response** — relay returns snapshot of all channels with active subscribers |
 | `ACTIVE_RSP` (0x16) | **Unicast to requester only** — delivers `{channel: [nicks]}` map |
 
-Stale subscriptions (idle > TTL) are pruned every 30 seconds in the background.
+Stale subscriptions are evicted by an active keep-alive probe loop that runs every 15 seconds:
+
+1. Any client that has sent nothing for **90 seconds** receives a unicast `PKT_PING` probe directly from the relay.
+2. If the client responds with any packet within the next **30 seconds**, the probe is cancelled and the subscription stays.
+3. If no response arrives within 30 seconds, the client is evicted immediately and logged.
+4. A passive TTL backstop (default `--ttl 300`) evicts any client that slips through the probe logic.
+
+The total worst-case detection time for a dead connection is therefore **120 seconds** (90 s silence + 30 s grace), compared to 300 s with a pure TTL. The relay logs `"Probe sent → NICK"` (at normal verbosity) and `"Dropped (no probe response): NICK"` (always) for each event.
+
 Scan sessions expire after 60 seconds.
 
 ### System channels
@@ -759,10 +782,13 @@ Frequency channels behave exactly like postal-code channels:
 GeoTalk 2.1.0 adds `/play` — transmit a WAV file as voice audio on the active channel.
 
 ```bash
-# Transmit a file
+# Transmit a file once
 /play /path/to/file.wav
 
-# Stop mid-file
+# Transmit a file in a continuous loop
+/play-loop /path/to/file.wav
+
+# Stop mid-file or stop a loop
 /play stop
 ```
 
@@ -775,20 +801,35 @@ The status line confirms the file is transmitting:
 
 ```
 [PLAY] Transmitting beacon.wav  2.4s · opus
-[PLAY] Transmitting id.wav      1.0s · opus (stereo→mono)
+[PLAY-LOOP] Looping id.wav  1.0s/loop · opus  [/play stop or Space to stop]
 ```
 
-Playback runs in a background thread so the REPL stays responsive. A second `/play` call while one is already in progress is rejected until the first finishes or `/play stop` is called.
+Playback runs in a background thread so the REPL stays responsive. A second `/play` or `/play-loop` call while one is already in progress is rejected until it finishes or `/play stop` is called.
 
-In the **GUI**, a green **▶ PLAY** button sits next to the mute button in the bottom bar. Clicking it opens a file-browser popup to select a WAV file. Once playing, the button changes to **■ STOP** — click again to abort. The status bar shows **▶ PLAYING** while a file is transmitting.
+In the **GUI**, a green **▶ PLAY** button sits in the bottom bar next to the mute button. A **Loop** checkbox immediately to its right controls whether playback repeats. When a loop is running the button shows **■ LOOP** — click it or press `Space` (outside the REPL) to stop. For a single-shot play the button shows **■ STOP**.
 
 **Preparing files with ffmpeg:**
 ```bash
 # Convert any audio file to the required format (48 kHz, mono, 16-bit PCM)
-ffmpeg -i input.mp3 -ar 48000 -ac 1 -sample_fmt s16 output.wav
+ffmpeg -i input.mp3  -ar 48000 -ac 1 -sample_fmt s16 output.wav
 ffmpeg -i input.flac -ar 48000 -ac 1 -sample_fmt s16 output.wav
 ffmpeg -i input.ogg  -ar 48000 -ac 1 -sample_fmt s16 output.wav
 ```
+
+---
+
+## Incoming Audio Recording
+
+GeoTalk 2.3.0 adds the ability to record all incoming audio to a WAV file directly from the GUI.
+
+Click the red **⏺ REC** button in the bottom bar (to the right of the Loop checkbox). A save-file dialog opens — choose a filename and location. Recording starts immediately and all received audio frames from every sender on the active channel are written in real time to a **16-bit PCM, mono, 48 kHz** WAV file.
+
+To stop recording, click **⏹ STOP** (the same button). The file is closed and a confirmation is shown in the message log. Recording also stops automatically if you disconnect or connect to a different relay.
+
+**Notes:**
+- The recording captures the decoded PCM mix before it reaches the local speaker, so it works regardless of your local mute state.
+- Each sender's frames arrive interleaved in the order they are decoded — the file is a faithful capture of the channel audio stream.
+- There is no CLI equivalent; recording is a GUI-only feature in this version.
 
 ---
 
@@ -832,8 +873,12 @@ ffmpeg -i input.ogg  -ar 48000 -ac 1 -sample_fmt s16 output.wav
 | ~~Active channel list~~ | ✅ Built-in since v1.9.0 — `/active` queries relay for all live channels with subscriber counts and nicks |
 | ~~Join-active startup~~ | ✅ Built-in since v1.9.0 — `--join-active` joins every live relay channel automatically on startup |
 | ~~WAV file playback~~ | ✅ Built-in since v2.1.0 — `/play file.wav` · 16-bit PCM, 48 kHz, mono or stereo, Opus-encoded, real-time paced |
+| ~~WAV loop playback~~ | ✅ Built-in since v2.2.0 — `/play-loop file.wav` · repeats until `/play stop` or Space; GUI Loop checkbox |
+| ~~Incoming audio recording~~ | ✅ Built-in since v2.3.0 — GUI ⏺ REC button · 16-bit / 48 kHz mono WAV · real-time write · stops on disconnect |
 | ~~Frequency channels~~ | ✅ Built-in since v2.1.0 — `#FREQ:145500` / `#FREQ:145.500` — kHz or MHz decimal, band name lookup, full relay+multicast support |
 | ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY`; `#INFO` and `#EMERGENCY` auto-joined on startup, `#TEST` manual only; client BBS posts rejected |
+| ~~Active keep-alive probing~~ | ✅ Built-in since v2.3.0 — relay probes silent clients after 90 s; drops them after 30 s grace; total detection ≤ 120 s |
+| ~~UDP jitter buffer~~ | ✅ Built-in since v2.2.0 — incoming audio frames held up to ~60 ms for reorder correction; zero added latency when packets arrive in order |
 
 ---
 
