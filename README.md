@@ -1,13 +1,13 @@
 # GeoTalk 📡
 **Pseudo-HAM Radio & Text Messaging — Geo-grouped by Postal Code**
 
-GeoTalk is a Linux CLI tool that turns any postal code into a radio channel.
+GeoTalk is a VoIP/Radio program that turns any postal code into a radio channel.
 Users in the same postal zone share a UDP group; voice (PTT) and text
 messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 2.1.0**
+**Version 2.3.3**
 
 ---
 
@@ -174,7 +174,7 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.3.0 ─┐
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.3.3 ─┐
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
 │              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
