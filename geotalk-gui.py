@@ -1246,6 +1246,10 @@ class GeoTalkGUI:
         result = self.gt.switch_channel(raw)
         if result:
             self._ingest_result(strip_ansi(result))
+        # Fetch BBS messages for the newly active channel
+        if self.gt.relay_mode and self.gt.active:
+            self.gt.relay.send(
+                gt_mod.encode_bbs_req(self.gt.nick, self.gt.active))
         self._refresh_channels()
 
     def _refresh_channels(self):
