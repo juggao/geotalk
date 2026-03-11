@@ -19,6 +19,8 @@ Layout
 
 import sys
 import os
+import math
+import struct
 import queue
 import threading
 import time
@@ -108,6 +110,61 @@ class _QueueWriter:
 
     def isatty(self):
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDIO BEEPS  — pure-Python PCM synthesis via pyaudio (no extra deps)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _synth_pcm(notes: list[tuple[float, float, float]], rate: int = 22050) -> bytes:
+    """Synthesise a sequence of (freq_hz, duration_s, volume 0-1) notes into
+    16-bit signed mono PCM bytes.  Silence between notes is not added."""
+    frames = []
+    for freq, dur, vol in notes:
+        n = int(rate * dur)
+        for i in range(n):
+            t = i / rate
+            # Sine with simple linear fade-out over last 10 % to avoid clicks
+            env = 1.0 if i < n * 0.90 else (n - i) / (n * 0.10)
+            sample = vol * env * math.sin(2 * math.pi * freq * t)
+            frames.append(struct.pack("<h", int(sample * 32767)))
+    return b"".join(frames)
+
+
+# Pre-synthesise both beeps once at import time so playback has zero latency.
+# Normal channel beep: short soft double-blip (440 Hz + 880 Hz)
+_BEEP_NORMAL: bytes = _synth_pcm([
+    (880, 0.06, 0.35),
+    (0,   0.04, 0.0),   # silence gap
+    (880, 0.06, 0.35),
+])
+# Emergency alarm: harsh pulsed two-tone (960 Hz / 1400 Hz), three bursts
+_BEEP_EMERGENCY: bytes = _synth_pcm([
+    (1400, 0.12, 0.80),
+    (960,  0.10, 0.80),
+    (1400, 0.12, 0.80),
+    (960,  0.10, 0.80),
+    (1400, 0.12, 0.80),
+    (960,  0.10, 0.80),
+])
+
+
+def _play_beep(pcm: bytes, rate: int = 22050) -> None:
+    """Play raw 16-bit mono PCM in a fire-and-forget daemon thread."""
+    def _run():
+        try:
+            import pyaudio as _pa
+            p = _pa.PyAudio()
+            stream = p.open(format=_pa.paInt16, channels=1, rate=rate,
+                            output=True)
+            stream.write(pcm)
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+        except Exception:
+            pass
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -369,6 +426,7 @@ class GeoTalkGUI:
         self._theme     = "light"     # current theme: "dark" | "light"
         self._mute_ch_var = None      # BooleanVar for channel-mute checkbox (set in _build_ui)
         self._vu_level  = 0.0         # latest RMS level [0,1] written by audio thread
+        self._beep_active: set[str] = set()  # channels where beep already played this transmission
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -1617,6 +1675,7 @@ class GeoTalkGUI:
         if "[voice]" in lo:
             self._append_line(line, "voice")
             self._refresh_channels()
+            self._beep_for_voice(line)
         elif "→" in line and "online" in lo:
             self._append_line(line, "ping")
         elif any(x in lo for x in ("[", "]")) and ":" in line:
@@ -1632,6 +1691,35 @@ class GeoTalkGUI:
             self._append_line(line, "error")
         else:
             self._append_line(line, "system")
+
+    def _beep_for_voice(self, line: str) -> None:
+        """Play a notification beep when a new transmission starts on a channel.
+        A transmission is considered ongoing as long as [VOICE] lines keep
+        arriving (each one resets the 2 s [VOICE] throttle in geotalk.py).
+        We track which channels already have an in-progress beep in
+        _beep_active.  A channel is removed from that set once its
+        _audio_active_ts has aged past AUDIO_TTL (meaning silence resumed),
+        so the next transmission triggers a fresh beep.
+        Emergency channel plays a harsh alarm instead of a soft blip."""
+        m = re.search(r"#(\S+)\s*$", line)
+        channel = m.group(1).upper() if m else ""
+
+        # Clear stale entries — channels that have gone quiet since last beep
+        if self.gt:
+            AUDIO_TTL = 2.5
+            now = time.monotonic()
+            stale = {ch for ch in self._beep_active
+                     if now - self.gt._audio_active_ts.get(ch, 0.0) >= AUDIO_TTL}
+            self._beep_active -= stale
+
+        if channel in self._beep_active:
+            return                       # already beeped for this transmission
+        self._beep_active.add(channel)
+
+        if channel == "EMERGENCY":
+            _play_beep(_BEEP_EMERGENCY)
+        else:
+            _play_beep(_BEEP_NORMAL)
 
     def _parse_text_msg(self, line: str):
         """Try to render a GeoTalk text message with coloured parts."""
