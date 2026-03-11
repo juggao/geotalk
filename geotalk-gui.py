@@ -71,7 +71,14 @@ def strip_ansi(s: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _QueueWriter:
-    """Replaces sys.stdout so GeoTalk's sys.stdout.write() posts to our queue."""
+    """Replaces sys.stdout so GeoTalk's sys.stdout.write() posts to our queue.
+
+    GeoTalk uses the CLI idiom of writing '\\r' before each message to
+    overwrite the prompt, then a trailing '\\r' to reprint the prompt with
+    no newline.  In a real terminal the prompt text is erased by the next
+    write.  Here we emulate that by keeping only the content *after* the
+    last '\\r' on each completed line — anything before it was "overwritten".
+    """
     def __init__(self, q: queue.Queue):
         self._q = q
         self._buf = ""
@@ -80,14 +87,24 @@ class _QueueWriter:
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            line = strip_ansi(line).strip("\r")
+            # Honour \r: discard everything up to and including the last \r
+            # (terminal carriage-return overwrites from column 0 — the CLI
+            # uses this to erase the prompt before printing a message).
+            if "\r" in line:
+                line = line.rsplit("\r", 1)[1]
+            line = strip_ansi(line).strip()
             if line:
                 self._q.put(("msg", line))
 
     def flush(self):
-        if self._buf.strip():
-            self._q.put(("msg", strip_ansi(self._buf).strip("\r")))
-            self._buf = ""
+        # In a real terminal flush() drains buffered output to the device.
+        # Here, every complete line (terminated with \n) is already queued
+        # by write().  Anything still in _buf has no \n — it is an incomplete
+        # line such as the CLI prompt ("SYSOP@#chan> ").  We discard it:
+        # emitting partial lines causes prompt strings to appear as messages
+        # in the GUI chat pane, especially when the [VOICE] throttle suppresses
+        # the preceding write() but sys.stdout.flush() still runs.
+        self._buf = ""
 
     def isatty(self):
         return False
@@ -1074,6 +1091,7 @@ class GeoTalkGUI:
                                 highlightbackground=P["red"])
         self._prompt_lbl.configure(fg=P["red"])
         self._append_line("▶ PTT ON", "voice")
+        self._refresh_channels()
         _ = result
 
     def _ptt_up(self, event):
@@ -1085,6 +1103,7 @@ class GeoTalkGUI:
                                 highlightbackground=P["red_dim"])
         self._prompt_lbl.configure(fg=P["amber"])
         self._append_line("■ PTT OFF", "ping")
+        self._refresh_channels()
         _ = result
 
     def _ptt_toggle(self):
@@ -1426,22 +1445,51 @@ class GeoTalkGUI:
     def _refresh_channels(self):
         if not self.gt:
             return
+        now = time.monotonic()
+        # Audio is considered "active" on a channel if a frame arrived in the
+        # last 2.5 seconds (covers the 2 s [VOICE] throttle with margin).
+        AUDIO_TTL = 2.5
+
+        new_keys    = []
+        new_entries = []
+        new_colours = []
+        for k, ch in self.gt.channels.items():
+            marker  = "► " if k == self.gt.active else "  "
+            display = ch.pattern.display()
+            users   = ch.active_users()
+            if self.gt.nick and self.gt.nick not in users:
+                users = [self.gt.nick] + users
+            ustr = f" ({len(users)})" if users else ""
+            new_entries.append(f"{marker}#{display}{ustr}")
+            new_keys.append(k)
+            # Colour: RED if active channel + PTT held, GREEN if audio flowing,
+            # normal text colour otherwise.
+            if k == self.gt.active and self._ptt_pressed:
+                new_colours.append(P["red"])
+            elif (now - self.gt._audio_active_ts.get(k, 0.0)) < AUDIO_TTL:
+                new_colours.append(P["green"])
+            else:
+                new_colours.append(P["text"])
+
+        # Repopulate if content or colours changed
+        cur_entries = list(self._chan_list.get(0, "end"))
+        cur_colours = [self._chan_list.itemcget(i, "foreground")
+                       for i in range(self._chan_list.size())]
+        if (new_entries == cur_entries and new_keys == self._chan_keys
+                and new_colours == cur_colours):
+            return
+
         self._chan_refreshing = True
         try:
             self._chan_list.delete(0, "end")
             self._chan_keys = []
-            for k, ch in self.gt.channels.items():
-                marker = "► " if k == self.gt.active else "  "
-                display = ch.pattern.display()
-                users = ch.active_users()
-                # Include own nick in the count — own packets are not echoed back
-                if self.gt.nick and self.gt.nick not in users:
-                    users = [self.gt.nick] + users
-                ustr = f" ({len(users)})" if users else ""
-                self._chan_list.insert("end", f"{marker}#{display}{ustr}")
+            for i, (k, entry, colour) in enumerate(
+                    zip(new_keys, new_entries, new_colours)):
+                self._chan_list.insert("end", entry)
+                self._chan_list.itemconfig(i, foreground=colour)
                 self._chan_keys.append(k)
                 if k == self.gt.active:
-                    self._chan_list.selection_set("end")
+                    self._chan_list.selection_set(i)
         finally:
             self._chan_refreshing = False
 
@@ -1502,19 +1550,23 @@ class GeoTalkGUI:
     # ── Queue polling (inbound messages from GeoTalk threads) ────────────────
 
     def _poll_queue(self):
-        try:
-            while True:
+        # Process at most 20 items per poll cycle so the Tk main thread is
+        # never monopolised by a burst of incoming messages (e.g. rapid audio
+        # notifications from a stream daemon).  Remaining items are picked up
+        # in the next cycle 80 ms later.
+        for _ in range(20):
+            try:
                 item = self._q.get_nowait()
-                kind = item[0]
-                if kind == "msg":
-                    self._dispatch_incoming(item[1])
-                elif kind == "connected":
-                    self._on_connected(item[1], item[2])   # (gt, cfg)
-                elif kind == "connect_error":
-                    self._append_line(f"Connection failed: {item[1]}", "error")
-                    self._hdr_status.configure(text="CONNECTION FAILED", fg=P["red"])
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                break
+            kind = item[0]
+            if kind == "msg":
+                self._dispatch_incoming(item[1])
+            elif kind == "connected":
+                self._on_connected(item[1], item[2])   # (gt, cfg)
+            elif kind == "connect_error":
+                self._append_line(f"Connection failed: {item[1]}", "error")
+                self._hdr_status.configure(text="CONNECTION FAILED", fg=P["red"])
         self.root.after(self.POLL_MS, self._poll_queue)
 
     def _dispatch_incoming(self, line: str):
@@ -1522,6 +1574,7 @@ class GeoTalkGUI:
         lo = line.lower()
         if "[voice]" in lo:
             self._append_line(line, "voice")
+            self._refresh_channels()
         elif "→" in line and "online" in lo:
             self._append_line(line, "ping")
         elif any(x in lo for x in ("[", "]")) and ":" in line:
@@ -1531,11 +1584,12 @@ class GeoTalkGUI:
             self._append_line(line, "bbs")
         elif any(x in lo for x in ("joined", "left", "active →")):
             self._append_line(line, "joined")
+            # Channel list changes on join/leave — refresh immediately
+            self._refresh_channels()
         elif any(x in lo for x in ("error", "failed", "invalid")):
             self._append_line(line, "error")
         else:
             self._append_line(line, "system")
-        self._refresh_channels()
 
     def _parse_text_msg(self, line: str):
         """Try to render a GeoTalk text message with coloured parts."""

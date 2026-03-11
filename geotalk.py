@@ -23,6 +23,7 @@ import collections
 import time
 import json
 import struct
+import math
 import argparse
 import hashlib
 import readline
@@ -1347,61 +1348,57 @@ class MulticastSocket:
 
 class AudioEngine:
     """
-    Capture mic → UDP / mix and play incoming UDP PCM streams.
+    Capture mic → UDP and play incoming audio from the active channel.
 
-    Mixing
-    ──────
-    Each remote sender gets its own ring buffer (deque of decoded PCM chunks).
-    A dedicated mixer thread wakes every AUDIO_CHUNK/AUDIO_RATE seconds
-    (~20 ms at 48 kHz / 960 samples).  It grabs one chunk per active sender,
-    sums int16 samples with saturation clipping to ±32767, and writes the
-    single mixed frame to the output stream.
-
-    Senders that have not delivered a chunk within MIXER_SENDER_TIMEOUT
-    seconds are considered silent and skipped.  This handles the common
-    case where Alice stops talking before the mixer tick — her buffer goes
-    empty, only Bob's audio is mixed, and there is no glitch.
+    Only audio arriving on the currently active channel key is played.
+    Frames from other channels are decoded (for the record callback) but
+    not buffered for playback.  This eliminates the multi-sender mixer
+    entirely: the output callback simply pops one frame from a single
+    ring buffer and plays it, or emits silence when the buffer is dry.
 
     Codec
     ─────
     When opuslib is available, mic audio is Opus-encoded before transmission
-    and decoded on receipt.  At 48 kHz / 960 samples / 32 kbit/s each packet
-    is ~80 bytes vs ~1920 bytes raw PCM — a ~24x reduction.  Falls back to
-    raw int16 PCM if opuslib is not installed; the "codec" JSON field allows
-    both modes to interoperate seamlessly.
+    and decoded on receipt.  Falls back to raw int16 PCM if opuslib is not
+    installed; the "codec" JSON field allows both modes to interoperate.
     """
 
-    # How many chunks to buffer per sender before dropping (back-pressure)
-    SENDER_QUEUE_DEPTH = 16
-    # Seconds after last packet before a sender is evicted from the mixer
-    SENDER_TIMEOUT     = 2.0
-    # Mixer tick interval — should match one frame period
-    MIXER_TICK         = AUDIO_CHUNK / AUDIO_RATE   # ~0.020 s at 48 kHz
-    # Jitter buffer: hold up to this many frames waiting for out-of-order seq
-    # before releasing.  8 frames = ~160 ms — covers typical internet jitter.
-    JITTER_WINDOW      = 8
-    # PLC: maximum consecutive ticks to repeat last frame when buffer runs dry.
-    # After this many ticks the concealment fades to silence.  At 20 ms/tick
-    # this gives 60 ms of concealment before fade, well within intelligibility.
-    PLC_MAX_TICKS      = 3
-    # Output stream hardware buffer — 4× the frame size gives PortAudio enough
-    # headroom to absorb scheduler jitter without underrunning.
-    OUTPUT_BUFFER_FRAMES = AUDIO_CHUNK * 4
+    # RX ring buffer depth — number of decoded PCM frames to hold.
+    # At 20 ms/frame, 8 frames = 160 ms of buffering, enough to absorb
+    # typical LAN/relay jitter without noticeable latency.
+    RX_QUEUE_DEPTH = 8
+    # Output stream hardware buffer
+    OUTPUT_BUFFER_FRAMES = AUDIO_CHUNK
+
+    # Precomputed frame constants used in the PortAudio callback.
+    _N_BYTES = AUDIO_CHUNK * 2
+    _SILENCE = b"\x00" * (AUDIO_CHUNK * 2)
 
     def __init__(self):
-        self.pa          = None
-        self._opus_enc   = None   # opuslib.Encoder  (None if unavailable)
-        self._opus_dec   = None   # opuslib.Decoder  (None if unavailable)
-        self._ptt        = False
-        self._muted      = False
-        self._running    = False
-        self._tx_cb      = None   # called with (audio_bytes, seq)
-        self._seq        = 0
-        self._record_cb  = None   # called with decoded PCM bytes for each RX frame
+        self.pa           = None
+        self._opus_enc    = None   # opuslib.Encoder  (None if unavailable)
+        self._opus_dec    = None   # opuslib.Decoder  (None if unavailable)
+        self._ptt         = False
+        self._muted       = False
+        self._running     = False
+        self._tx_cb       = None   # called with (audio_bytes, seq)
+        self._seq         = 0
+        self._record_cb   = None   # called with decoded PCM bytes for each RX frame
+        self._pa_continue = None   # set in start() once pyaudio is imported
 
-        # Per-sender state — see feed_audio() for field descriptions
-        self._senders: dict[str, dict] = {}
-        self._sender_lock = threading.Lock()
+        # Single-channel RX ring buffer — only frames for the active channel key.
+        self._rx_buf      = collections.deque(maxlen=self.RX_QUEUE_DEPTH)
+        self._rx_lock     = threading.Lock()
+        # The channel key whose audio is currently played.
+        # Set by GeoTalk via set_active_channel() whenever self.active changes.
+        self._active_key  = None
+
+        # Per-channel Opus decoders.  The Opus decoder is stateful (it tracks
+        # packet-loss history and stream continuity).  A single shared decoder
+        # fed frames from two different channels produces garbled output because
+        # each channel's packets corrupt the other's decoder state.
+        # Key: channel_key str → opuslib.Decoder instance.
+        self._opus_decs: dict[str, object] = {}
 
         if AUDIO_AVAILABLE:
             try:
@@ -1439,120 +1436,53 @@ class AudioEngine:
             return
         self._tx_cb   = tx_callback
         self._running = True
+
+        import pyaudio as _pa
+        self._pa_continue = _pa.paContinue
+
         self._rx_stream = self.pa.open(
             format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
             rate=AUDIO_RATE, output=True,
-            frames_per_buffer=self.OUTPUT_BUFFER_FRAMES)
+            frames_per_buffer=AUDIO_CHUNK,
+            stream_callback=self._rx_callback)
+
         self._tx_stream = self.pa.open(
             format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
             rate=AUDIO_RATE, input=True,
             frames_per_buffer=AUDIO_CHUNK,
             stream_callback=self._capture_cb)
-        self._mixer_thread = threading.Thread(target=self._mixer_loop,
-                                              daemon=True, name="mixer")
-        self._mixer_thread.start()
+
+    def set_active_channel(self, key: str | None):
+        """Switch the playback channel.  Clears the RX buffer immediately."""
+        with self._rx_lock:
+            self._active_key = key
+            self._rx_buf.clear()
+
+    def drop_channel_decoder(self, key: str):
+        """Free the Opus decoder for a channel that has been left."""
+        self._opus_decs.pop(key, None)
 
     def _capture_cb(self, in_data, frame_count, time_info, status):
-        import pyaudio as _pa
         if self._ptt and self._tx_cb:
             if self._opus_enc:
                 try:
                     audio = self._opus_enc.encode(in_data, AUDIO_CHUNK)
                 except Exception:
-                    audio = in_data   # fallback to raw PCM on encode error
+                    audio = in_data
             else:
-                audio = in_data       # no opuslib — send raw PCM
+                audio = in_data
             self._tx_cb(audio, self._seq)
             self._seq += 1
-        return (None, _pa.paContinue)
+        return (None, self._pa_continue)
 
-    # ── mixer ─────────────────────────────────────────────────────────────
-
-    def _mixer_loop(self):
-        """
-        Tick once per frame period using absolute-deadline scheduling to
-        prevent cumulative drift.  Collect one chunk from every active sender,
-        mix by summing int16 samples with clipping, write to output.
-
-        PLC (Packet Loss Concealment): when a sender's playback buffer is
-        empty but they are still active, repeat their last good frame for up
-        to PLC_MAX_TICKS consecutive ticks with a linear fade-out.  After
-        that the concealment stops so a long dropout decays to silence rather
-        than buzzing with a stuck frame.
-
-        Absolute-deadline scheduling: the next wakeup is always computed as
-        deadline += tick rather than sleep(tick - elapsed).  This prevents
-        OS scheduler jitter from compounding across ticks.
-        """
-        import struct as _struct
-        n_samples  = AUDIO_CHUNK
-        n_bytes    = n_samples * 2          # int16 = 2 bytes
-        silence    = b"\x00" * n_bytes
-        fmt        = f"<{n_samples}h"
-        tick       = self.MIXER_TICK
-        plc_max    = self.PLC_MAX_TICKS
-
-        deadline = time.monotonic()         # absolute next-tick target
-
-        while self._running:
-            deadline += tick
-            chunks    = []
-            evict     = []
-
-            with self._sender_lock:
-                now = time.monotonic()
-                for nick, state in list(self._senders.items()):
-                    if now - state["last"] > self.SENDER_TIMEOUT:
-                        evict.append(nick)
-                        continue
-                    buf = state["buf"]
-                    if buf:
-                        pcm = buf.popleft()
-                        state["last_pcm"]  = pcm
-                        state["plc_ticks"] = 0
-                        chunks.append(pcm)
-                    elif state["last_pcm"] is not None and state["plc_ticks"] < plc_max:
-                        # PLC: apply a linear fade so each successive repeat is
-                        # quieter — avoids a hard cut while still decaying.
-                        t        = state["plc_ticks"]
-                        gain_num = plc_max - t      # e.g. 3,2,1 for plc_max=3
-                        gain_den = plc_max
-                        if gain_num > 0:
-                            samples = list(_struct.unpack(fmt,
-                                           state["last_pcm"][:n_bytes]))
-                            faded   = _struct.pack(fmt, *[
-                                int(s * gain_num // gain_den) for s in samples])
-                            chunks.append(faded)
-                        state["plc_ticks"] += 1
-                    # else: concealment exhausted or no frame yet — silence
-
-                for nick in evict:
-                    del self._senders[nick]
-
-            if not self._muted and chunks:
-                if len(chunks) == 1:
-                    mixed = chunks[0]
-                else:
-                    arrays = [list(_struct.unpack(fmt, c[:n_bytes]))
-                               for c in chunks]
-                    mixed  = _struct.pack(fmt, *[
-                        max(-32768, min(32767,
-                            sum(arrays[s][i] for s in range(len(arrays)))))
-                        for i in range(n_samples)])
-                try:
-                    self._rx_stream.write(mixed)
-                except Exception:
-                    pass
-            else:
-                try:
-                    self._rx_stream.write(silence)
-                except Exception:
-                    pass
-
-            # Absolute-deadline sleep — never drifts regardless of write latency
-            sleep_t = deadline - time.monotonic()
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+    def _rx_callback(self, in_data, frame_count, time_info, status):
+        """PortAudio output callback — pop one frame from the RX buffer or silence."""
+        if self._muted:
+            return (self._SILENCE, self._pa_continue)
+        with self._rx_lock:
+            if self._rx_buf:
+                return (self._rx_buf.popleft(), self._pa_continue)
+        return (self._SILENCE, self._pa_continue)
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -1573,114 +1503,59 @@ class AudioEngine:
         return self._muted
 
     def set_record_callback(self, fn):
-        """Register a callable(pcm_bytes) that receives every decoded
-        incoming audio frame.  Called from the feed_audio thread — the
-        callable must be fast and non-blocking (e.g. put to a queue)."""
+        """Register a callable(pcm_bytes) called with each decoded RX frame."""
         self._record_cb = fn
 
     def clear_record_callback(self):
-        """Remove the recording callback."""
         self._record_cb = None
 
-    def feed_audio(self, audio: bytes, nick: str = "",
-                   codec: str = "pcm", seq: int = -1):
+    def feed_audio(self, audio: bytes, channel_key: str = "",
+                   nick: str = "", codec: str = "pcm", seq: int = -1):
         """
-        Deliver an audio frame from `nick` into the per-sender jitter buffer.
+        Deliver one decoded audio frame for `channel_key`.
 
-        Frames are held in a small sorted window (JITTER_WINDOW frames) so
-        that UDP reordering is corrected before the frame reaches the mixer.
-        Opus frames are decoded to raw int16 PCM before buffering so the
-        mixer always works with uniform PCM regardless of the sender's codec.
+        Only frames whose channel_key matches self._active_key are queued for
+        playback.  All frames (regardless of channel) are passed to the record
+        callback if one is registered.
 
-        `seq` is the sender's monotonic packet sequence number (field "s" in
-        the wire header).  Pass -1 (default) to bypass sequencing and append
-        directly — used for legacy peers that omit the field.
+        Opus frames are decoded to raw int16 LE PCM before buffering.
+        Truncated frames are zero-padded; oversized frames are trimmed.
         """
-        if self._muted:
-            return
-        if not nick:
-            nick = "_unknown_"
-        # Decode Opus → PCM before buffering
+        # Decode Opus → PCM using a per-channel decoder so each channel's
+        # stateful decode history is kept separate.
         if codec == "opus" and self._opus_dec:
+            dec = self._opus_decs.get(channel_key)
+            if dec is None:
+                try:
+                    dec = opuslib.Decoder(AUDIO_RATE, AUDIO_CHANNELS)
+                    self._opus_decs[channel_key] = dec
+                except Exception:
+                    return
             try:
-                pcm = self._opus_dec.decode(audio, AUDIO_CHUNK)
+                pcm = dec.decode(audio, AUDIO_CHUNK)
             except Exception:
-                return   # drop corrupted frame rather than pass noise to mixer
+                return
         else:
-            pcm = audio  # raw PCM (legacy peer or opuslib not installed)
-        # Deliver decoded PCM to the recording callback (if active)
+            pcm = audio
+        # Normalise to exactly _N_BYTES
+        nb = self._N_BYTES
+        if len(pcm) < nb:
+            pcm = pcm + b"\x00" * (nb - len(pcm))
+        elif len(pcm) > nb:
+            pcm = pcm[:nb]
+        # Recording callback — fires for all channels
         cb = self._record_cb
         if cb:
             try:
                 cb(pcm)
             except Exception:
                 pass
-        with self._sender_lock:
-            if nick not in self._senders:
-                self._senders[nick] = {
-                    "buf":        collections.deque(maxlen=self.SENDER_QUEUE_DEPTH),
-                    "hold":       [],          # list of (seq, pcm) waiting to be ordered
-                    "next_seq":   seq,         # next seq we expect to emit
-                    "held_since": None,        # monotonic time when gap first detected
-                    "last":       time.monotonic(),
-                    "last_pcm":   None,        # last good PCM frame for PLC
-                    "plc_ticks":  0,           # consecutive ticks of PLC concealment
-                }
-            state = self._senders[nick]
-            state["last"] = time.monotonic()
-
-            if seq < 0 or state["next_seq"] < 0:
-                # No sequence info — append directly (legacy path)
-                state["buf"].append(pcm)
-                state["last_pcm"] = pcm
-            else:
-                # Insert into the hold buffer sorted by seq
-                import bisect as _bisect
-                keys = [s for s, _ in state["hold"]]
-                pos  = _bisect.bisect_left(keys, seq)
-                state["hold"].insert(pos, (seq, pcm))
-                self._flush_hold(state)
-
-    def _flush_hold(self, state: dict):
-        """
-        Release frames from the jitter hold buffer into the playback deque.
-        Called with self._sender_lock held.
-
-        Release strategy:
-          1. Contiguous from next_seq — emit all frames that arrive in order.
-          2. Deadline flush — if the gap (missing predecessor) has been open
-             for longer than JITTER_WINDOW mixer ticks, skip over it and emit
-             the next available frame.  held_since tracks when the gap was
-             *first detected*, not when the hold-list head last changed.
-        """
-        deadline = self.JITTER_WINDOW * self.MIXER_TICK
-        while state["hold"]:
-            top_seq, top_pcm = state["hold"][0]
-
-            if top_seq == state["next_seq"]:
-                # Arrived in order (or gap closed) — emit immediately
-                state["hold"].pop(0)
-                state["buf"].append(top_pcm)
-                state["last_pcm"] = top_pcm
-                state["next_seq"] = top_seq + 1
-                state["held_since"] = None   # gap resolved
-            else:
-                # There is a gap ahead of top_seq
-                now = time.monotonic()
-                if state["held_since"] is None:
-                    # First time we notice this gap — start the clock
-                    state["held_since"] = now
-                age = now - state["held_since"]
-                if age >= deadline:
-                    # Gap has been open too long — skip missing frames and emit
-                    state["hold"].pop(0)
-                    state["buf"].append(top_pcm)
-                    state["last_pcm"] = top_pcm
-                    state["next_seq"] = top_seq + 1
-                    state["held_since"] = None   # reset for next gap
-                else:
-                    # Still within the wait window — leave in hold
-                    break
+        # Playback — active channel only
+        if self._muted:
+            return
+        with self._rx_lock:
+            if channel_key and channel_key == self._active_key:
+                self._rx_buf.append(pcm)
 
     def stop(self):
         self._running = False
@@ -1693,6 +1568,8 @@ class AudioEngine:
                 self.pa.terminate()
             except Exception:
                 pass
+        with self._rx_lock:
+            self._rx_buf.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2173,6 +2050,12 @@ class GeoTalk:
         self._msg_id     = 0
         self._ptt_held   = False
         self._muted_channels: set = set()   # channel keys muted individually
+        # Maps channel key → monotonic time of last received audio frame.
+        # Used by the GUI to light up channels that are currently receiving audio.
+        self._audio_active_ts: dict[str, float] = {}
+        # Throttle [VOICE] stdout prints — at most once per 2 s per (nick, channel)
+        # so stream daemons sending 50 pkt/s don't flood the terminal / GUI queue.
+        self._voice_print_ts: dict[tuple, float] = {}
 
     @property
     def relay_mode(self) -> bool:
@@ -2253,6 +2136,7 @@ class GeoTalk:
         if self.active is None:
             self.active = key
             self._channel_history.append(key)
+            self.audio.set_active_channel(key)
 
         if self.relay_mode:
             # Relay path: subscribe the glob key AND all enumerated concrete
@@ -2308,6 +2192,7 @@ class GeoTalk:
 
         was_active = (self.active == key)
         del self.channels[key]
+        self.audio.drop_channel_decoder(key)
 
         if self.relay_mode:
             self.relay.unsubscribe(self.nick, key)
@@ -2358,6 +2243,7 @@ class GeoTalk:
             if self.active:
                 self._channel_history.append(self.active)
             self.active = key
+            self.audio.set_active_channel(key)
         region = pat.region_info(self._current_country)
         return (f"{CY}Active → #{pat.display()}{R}  "
                 f"{DM}{region}{R}")
@@ -3031,28 +2917,39 @@ class GeoTalk:
     def _render_packet(self, pkt: dict, nick: str, sender_postal: str,
                        pat: "ChannelPattern"):
         """Print an inbound packet to the terminal."""
-        ts     = datetime.now().strftime("%H:%M")
-        region = _lookup_region(sender_postal, self._current_country)
+        ts      = datetime.now().strftime("%H:%M")
+        region  = _lookup_region(sender_postal, self._current_country)
+        printed = False
 
         if pkt["type"] == "text":
             sys.stdout.write(
                 f"\r{DM}{ts}{R} {B}{CY}[{nick}]{R} "
                 f"{DM}({region}){R} "
                 f"#{pat.display()}: {pkt.get('t','')}\n")
+            printed = True
 
         elif pkt["type"] == "audio":
             if self._ptt_held:
-                return   # we are transmitting — discard incoming audio from others
+                return   # we are transmitting — discard incoming audio
             if pat.key in self._muted_channels:
                 return   # this channel is individually muted
-            self.audio.feed_audio(pkt.get("audio", b""), nick=nick,
+            self._audio_active_ts[pat.key] = time.monotonic()
+            self.audio.feed_audio(pkt.get("audio", b""),
+                                   channel_key=pat.key,
+                                   nick=nick,
                                    codec=pkt.get("codec", "pcm"),
                                    seq=pkt.get("s", -1))
             if not self.audio.is_muted:
-                sys.stdout.write(
-                    f"\r{DM}{ts}{R} {MG}[VOICE]{R} "
-                    f"{nick} {DM}({region}){R} "
-                    f"#{pat.display()} seq={pkt.get('s',0)}\n")
+                # Throttle [VOICE] print to once per 2 s per (nick, channel)
+                _key = (nick, pat.key)
+                _now = time.monotonic()
+                if _now - self._voice_print_ts.get(_key, 0.0) >= 2.0:
+                    self._voice_print_ts[_key] = _now
+                    sys.stdout.write(
+                        f"\r{DM}{ts}{R} {MG}[VOICE]{R} "
+                        f"{nick} {DM}({region}){R} "
+                        f"#{pat.display()}\n")
+                    printed = True
             else:
                 return   # muted — nothing to print or redraw
 
@@ -3060,9 +2957,11 @@ class GeoTalk:
             sys.stdout.write(
                 f"\r{DM}{ts}{R} {DM}→ {nick} online "
                 f"({region}) #{pat.display()}{R}\n")
+            printed = True
 
-        sys.stdout.flush()
-        self._redraw_prompt()
+        if printed:
+            sys.stdout.flush()
+            self._redraw_prompt()
 
     def _render_bbs_rsp(self, pkt: dict):
         """Render BBS messages received from the relay after joining a channel."""
@@ -3170,6 +3069,13 @@ class GeoTalk:
         self._redraw_prompt()
 
     def _redraw_prompt(self):
+        # Only redraw in a real terminal.  When sys.stdout is replaced by the
+        # GUI's _QueueWriter (isatty() → False) the prompt is meaningless — the
+        # GUI has its own input widget — and writing it would leave incomplete
+        # lines in _QueueWriter._buf that eventually get emitted as spurious
+        # "NICK@#CHANNEL> " messages in the chat pane.
+        if not sys.stdout.isatty():
+            return
         ch = self.channels.get(self.active)
         label = ch.pattern.display() if ch else (self.active or "?")
         prompt = f"{B}{GR}{self.nick}{R}@{B}{CY}#{label}{R}> "
@@ -3182,6 +3088,7 @@ class GeoTalk:
         self._running = True
         if AUDIO_AVAILABLE and self.audio.pa:
             self.audio.start(self.send_audio_chunk)
+            self.audio.set_active_channel(self.active)
 
         if self.relay_host:
             ok = self.relay.connect(self.relay_host, self.relay_port)
