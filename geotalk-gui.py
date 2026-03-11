@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-gui.py — GeoTalk Desktop GUI  v2.3.3
+geotalk-gui.py — GeoTalk Desktop GUI  v2.5.0
 A tkinter frontend for the GeoTalk radio-over-IP client.
 
 Layout
@@ -368,6 +368,7 @@ class GeoTalkGUI:
         self._rec_lock  = threading.Lock()  # guards _rec_wave writes
         self._theme     = "light"     # current theme: "dark" | "light"
         self._mute_ch_var = None      # BooleanVar for channel-mute checkbox (set in _build_ui)
+        self._vu_level  = 0.0         # latest RMS level [0,1] written by audio thread
         self._chan_keys: list[str] = []   # parallel to _chan_list rows
         self._chan_refreshing = False      # re-entrancy guard
         self._orig_stdout = sys.stdout
@@ -431,6 +432,20 @@ class GeoTalkGUI:
             relief="flat", bd=0, cursor="hand2",
             command=self._show_about)
         self._hdr_right.pack(side="right", padx=14)
+
+        # VU meter — 8-segment bar left of theme button
+        # Canvas is 3 px per segment + 1 px gap, 8 segments = 31 px wide, 14 px tall
+        self._vu_canvas = tk.Canvas(
+            hdr, width=31, height=14,
+            bg=P["bg"], highlightthickness=0, bd=0)
+        self._vu_canvas.pack(side="right", padx=(0, 6))
+        self._vu_segs = []   # list of canvas rectangle ids
+        SEG_W, SEG_H, SEG_GAP = 3, 14, 1
+        for i in range(8):
+            x = i * (SEG_W + SEG_GAP)
+            rid = self._vu_canvas.create_rectangle(
+                x, 0, x + SEG_W, SEG_H, fill=P["bg2"], outline="")
+            self._vu_segs.append(rid)
 
         # Theme toggle button — right side of header
         self._theme_btn = tk.Button(
@@ -671,6 +686,21 @@ class GeoTalkGUI:
 
     # ── Theme switching ───────────────────────────────────────────────────────
 
+    # ── VU meter ──────────────────────────────────────────────────────────────
+
+    # Segment colours: segments 0-4 green, 5-6 yellow, 7 red
+    _VU_COLOURS = ["#2ecc71", "#2ecc71", "#2ecc71", "#2ecc71", "#2ecc71",
+                   "#f0c040", "#f0c040", "#e04040"]
+    # Logarithmic thresholds — each segment lights when level exceeds its value
+    _VU_THRESH  = [0.01, 0.05, 0.12, 0.22, 0.35, 0.50, 0.68, 0.85]
+
+    def _draw_vu(self, level: float):
+        """Repaint the 8-segment VU bar for the given level (0.0–1.0)."""
+        for i, (rid, thresh, colour) in enumerate(
+                zip(self._vu_segs, self._VU_THRESH, self._VU_COLOURS)):
+            fill = colour if level >= thresh else P["bg2"]
+            self._vu_canvas.itemconfig(rid, fill=fill)
+
     def _toggle_theme(self):
         """Switch between dark and light themes."""
         if self._theme == "dark":
@@ -743,6 +773,9 @@ class GeoTalkGUI:
         self._theme_btn.configure(
             bg=P["bg"], fg=P["amber_dim"],
             activebackground=P["bg2"], activeforeground=P["amber"])
+        self._vu_canvas.configure(bg=P["bg"])
+        # Redraw all segments with new off-colour
+        self._draw_vu(self._vu_level)
 
         self._sidebar.configure(bg=P["bg2"])
         self._chan_list.configure(
@@ -997,6 +1030,12 @@ class GeoTalkGUI:
             fg=P["green"])
         self._hdr_right.configure(text=f"v{gt_mod.VERSION}")
         self._append_sys(f"Connected as {cfg['nick']}  [{mode}]")
+
+        # VU meter: level callback writes to _vu_level; _poll_queue reads it
+        def _vu_cb(level: float):
+            if level > self._vu_level:
+                self._vu_level = level
+        gt.audio.set_level_callback(_vu_cb)
 
         # Persist settings for next launch
         self._prefs.update({
@@ -1567,6 +1606,9 @@ class GeoTalkGUI:
             elif kind == "connect_error":
                 self._append_line(f"Connection failed: {item[1]}", "error")
                 self._hdr_status.configure(text="CONNECTION FAILED", fg=P["red"])
+        # VU meter: decay toward 0 each poll tick (80 ms), draw current level
+        self._vu_level = max(0.0, self._vu_level * 0.55)
+        self._draw_vu(self._vu_level)
         self.root.after(self.POLL_MS, self._poll_queue)
 
     def _dispatch_incoming(self, line: str):

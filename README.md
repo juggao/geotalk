@@ -7,7 +7,7 @@ messages are broadcast to everyone on that channel — like a local
 walkie-talkie net. Works on a LAN via IP multicast, or across the internet
 via a relay server.
 
-**Version 2.3.3**
+**Version 2.5.0** — VU meter · audio engine rewrite · active-channel sync fixes
 
 ---
 
@@ -27,7 +27,7 @@ via a relay server.
 | 🌐 | Relay mode | `--relay HOST` for internet use — no multicast routing needed |
 | 🔄 | Auto-reconnect | Client reconnects to relay with exponential back-off |
 | 🔒 | LAN mode | Pure peer-to-peer UDP multicast, zero infrastructure required |
-| 🔊 | Audio mixing | Simultaneous speakers are mixed in real time — no garbled interleaving |
+| 🔊 | Multi-channel RX | Subscribe to many channels at once; active channel audio plays; all arrive in one terminal |
 | 🏙️ | Postal reverse lookup | `/postal Venlo` finds all matching channel patterns by city name |
 | 📍 | Auto-channel | `--auto-channel` detects your location from public IP and joins the nearest channel automatically |
 | 📋 | BBS | `/bbs TEXT` posts a persistent message to the channel bulletin board; messages are auto-delivered on join (relay mode only) |
@@ -38,8 +38,8 @@ via a relay server.
 | 🚨 | System channels | Relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY` with seed BBS messages. `#INFO` and `#EMERGENCY` are joined automatically on relay startup; `#TEST` is not. Client BBS posts to system channels are rejected |
 | 🔁 | WAV loop playback | `/play-loop file.wav` transmits a WAV file on repeat until stopped — GUI has a **Loop** checkbox next to the PLAY button |
 | ⏺ | Incoming audio recording | GUI **REC** button records all incoming audio to a WAV file in real time — opens a save-file dialog; stop by pressing REC again |
+| 📊 | VU meter | 8-segment LED-style bar in the GUI header shows live audio level — green/yellow/red; reflects RX audio on active channel and TX mic during PTT |
 | 🩺 | Active keep-alive probing | Relay actively probes silent clients with a ping after 90 s of inactivity; drops them within 30 s if unanswered — no more zombie subscriptions |
-| 🔀 | UDP jitter buffer | Incoming audio frames are held in a short reorder window (~60 ms) before playback, correcting UDP out-of-order delivery without audible latency |
 
 ---
 
@@ -174,18 +174,20 @@ All settings are saved to `~/.config/geotalk/prefs.json` and pre-filled on the n
 ### Layout
 
 ```
-┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ─────────────── v2.3.3 ─┐
-├──────────────┬──────────────────────────────────────────────────────┤
-│ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there   │
-│              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14     │
-│ ► #59**  (2) │  10:33 ▶ PTT ON                                    │
-│   #5911AB    ├──────────────────────────────────────────────────────┤
-│              │ ➤  /scan 59**_                                      │
-│ [join entry] │                                                     │
-├──────────────┴──────────────────────────────────────────────────────┤
-│  ● PTT  ◉ MUTE  ▶ PLAY  ☐ Loop  ⏺ REC │ CH: #59**  users: 2     │
-└─────────────────────────────────────────────────────────────────────┘
+┌─ ◈ GEOTALK  PA3XYZ · NL · LAN multicast ──────── ▂▄▆░░░░░ ☾ v2.5.0 ─┐
+├──────────────┬──────────────────────────────────────────────────────────┤
+│ CHANNELS     │  10:31 [CHARLIE] (NL · Venlo) #59**: hello there       │
+│              │  10:32 [VOICE] BOB (NL · Tegelen) #5944 seq=14         │
+│ ► #59**  (2) │  10:33 ▶ PTT ON                                        │
+│   #5911AB    ├──────────────────────────────────────────────────────────┤
+│              │ ➤  /scan 59**_                                          │
+│ [join entry] │                                                         │
+├──────────────┴──────────────────────────────────────────────────────────┤
+│  ● PTT  ◉ MUTE  ▶ PLAY  ☐ Loop  ⏺ REC │ CH: #59**  users: 2         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+`▂▄▆░░░░░` — the 8-segment VU meter sits between the status text and the theme toggle `☾`/`☀`. Segments light green (low), yellow (mid), red (peak). It shows incoming audio level on the active channel at rest, and mic level while PTT is held.
 
 **Channels sidebar** — lists all joined channels with active user count. Click any
 channel to switch the active TX channel. Type a pattern in the join box and press
@@ -419,11 +421,9 @@ While PTT is active, incoming audio from others is discarded (no playback,
 no REPL output) — mirrors real radio behaviour. While muted, voice packet
 lines are suppressed in the REPL but text and ping messages still appear.
 
-When multiple peers transmit simultaneously, their audio streams are mixed
-in real time before playback — each sender has an independent ring buffer,
-and a mixer thread combines them sample-by-sample with saturation clipping
-every 20 ms (one Opus frame at 48 kHz / 960 samples). You hear a clean
-blend rather than interleaved fragments.
+Only the active channel's audio is played back. Channels joined in the
+background receive and decode audio independently (keeping their Opus decoder
+state clean) but are silent until you switch to them.
 
 With `opuslib` installed, transmitted audio is Opus-encoded at 32 kbit/s
 (~80 bytes per 20 ms frame) before sending and decoded on receipt — roughly
@@ -875,10 +875,12 @@ To stop recording, click **⏹ STOP** (the same button). The file is closed and 
 | ~~WAV file playback~~ | ✅ Built-in since v2.1.0 — `/play file.wav` · 16-bit PCM, 48 kHz, mono or stereo, Opus-encoded, real-time paced |
 | ~~WAV loop playback~~ | ✅ Built-in since v2.2.0 — `/play-loop file.wav` · repeats until `/play stop` or Space; GUI Loop checkbox |
 | ~~Incoming audio recording~~ | ✅ Built-in since v2.3.0 — GUI ⏺ REC button · 16-bit / 48 kHz mono WAV · real-time write · stops on disconnect |
+| ~~Audio engine rewrite~~ | ✅ Built-in since v2.4.0 — multi-sender mixer replaced by single active-channel playback; per-channel Opus decoders prevent cross-channel state corruption; `_set_active()` keeps `gt.active` and audio engine in sync atomically |
+| ~~VU meter~~ | ✅ Built-in since v2.5.0 — 8-segment LED bar in GUI header; green/yellow/red; RX level on active channel + TX mic level during PTT; logarithmic thresholds, 350 ms decay |
+| ~~UDP jitter buffer~~ | Removed in v2.4.0 — replaced by simpler per-channel RX ring buffer; reorder correction removed in favour of Opus PLC |
 | ~~Frequency channels~~ | ✅ Built-in since v2.1.0 — `#FREQ:145500` / `#FREQ:145.500` — kHz or MHz decimal, band name lookup, full relay+multicast support |
 | ~~System channels~~ | ✅ Built-in since v1.9.2 — relay auto-creates `#INFO`, `#TEST`, `#EMERGENCY`; `#INFO` and `#EMERGENCY` auto-joined on startup, `#TEST` manual only; client BBS posts rejected |
 | ~~Active keep-alive probing~~ | ✅ Built-in since v2.3.0 — relay probes silent clients after 90 s; drops them after 30 s grace; total detection ≤ 120 s |
-| ~~UDP jitter buffer~~ | ✅ Built-in since v2.2.0 — incoming audio frames held up to ~60 ms for reorder correction; zero added latency when packets arrive in order |
 
 ---
 

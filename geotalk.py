@@ -54,7 +54,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "2.3.3"
+VERSION      = "2.5.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -1400,6 +1400,11 @@ class AudioEngine:
         # Key: channel_key str → opuslib.Decoder instance.
         self._opus_decs: dict[str, object] = {}
 
+        # Level meter callback — called with a float in [0.0, 1.0] from the
+        # audio thread.  TX frames (PTT) and RX frames (active channel) both
+        # feed it.  Set by the GUI via set_level_callback(); None = disabled.
+        self._level_cb = None
+
         if AUDIO_AVAILABLE:
             try:
                 import os as _os
@@ -1473,6 +1478,12 @@ class AudioEngine:
                 audio = in_data
             self._tx_cb(audio, self._seq)
             self._seq += 1
+            cb = self._level_cb
+            if cb:
+                try:
+                    cb(self._pcm_rms(in_data))
+                except Exception:
+                    pass
         return (None, self._pa_continue)
 
     def _rx_callback(self, in_data, frame_count, time_info, status):
@@ -1508,6 +1519,26 @@ class AudioEngine:
 
     def clear_record_callback(self):
         self._record_cb = None
+
+    def set_level_callback(self, fn):
+        """Register a callable(level: float) for the VU meter.
+        Called from the audio thread with RMS level in [0.0, 1.0].
+        TX frames (PTT mic) and RX frames (active channel) both trigger it.
+        Pass None to disable."""
+        self._level_cb = fn
+
+    @staticmethod
+    def _pcm_rms(pcm: bytes) -> float:
+        """Return RMS amplitude of a raw int16-LE PCM frame as float in [0,1]."""
+        if len(pcm) < 2:
+            return 0.0
+        n = len(pcm) // 2
+        # sum of squares via fast byte arithmetic — avoids struct.unpack overhead
+        total = sum(
+            ((pcm[i] | (pcm[i + 1] << 8)) - (65536 if pcm[i + 1] & 0x80 else 0)) ** 2
+            for i in range(0, n * 2, 2)
+        )
+        return min(1.0, (total / n) ** 0.5 / 32768.0)
 
     def feed_audio(self, audio: bytes, channel_key: str = "",
                    nick: str = "", codec: str = "pcm", seq: int = -1):
@@ -1556,6 +1587,12 @@ class AudioEngine:
         with self._rx_lock:
             if channel_key and channel_key == self._active_key:
                 self._rx_buf.append(pcm)
+                cb = self._level_cb
+                if cb:
+                    try:
+                        cb(self._pcm_rms(pcm))
+                    except Exception:
+                        pass
 
     def stop(self):
         self._running = False
@@ -2134,9 +2171,8 @@ class GeoTalk:
         ch = Channel(pat)
         self.channels[key] = ch
         if self.active is None:
-            self.active = key
             self._channel_history.append(key)
-            self.audio.set_active_channel(key)
+            self._set_active(key)
 
         if self.relay_mode:
             # Relay path: subscribe the glob key AND all enumerated concrete
@@ -2212,7 +2248,7 @@ class GeoTalk:
                 if candidate in self.channels:
                     prev = candidate
                     break
-            self.active = prev
+            self._set_active(prev)
 
         ch_display = pat.display()
         result = f"{RD}Left #{ch_display}{R}"
@@ -2224,6 +2260,12 @@ class GeoTalk:
         elif was_active:
             result += f"\n{YL}No more channels — join one with #POSTCODE{R}"
         return result
+
+    def _set_active(self, key: str | None):
+        """Set the active channel and synchronise the audio engine in one step.
+        All code that changes self.active must go through this method."""
+        self.active = key
+        self.audio.set_active_channel(key)
 
     def switch_channel(self, raw: str) -> str:
         try:
@@ -2237,13 +2279,12 @@ class GeoTalk:
             if self.active != key:
                 if self.active:
                     self._channel_history.append(self.active)
-                self.active = key
+                self._set_active(key)
             return result
         if self.active != key:
             if self.active:
                 self._channel_history.append(self.active)
-            self.active = key
-            self.audio.set_active_channel(key)
+            self._set_active(key)
         region = pat.region_info(self._current_country)
         return (f"{CY}Active → #{pat.display()}{R}  "
                 f"{DM}{region}{R}")
@@ -3088,7 +3129,7 @@ class GeoTalk:
         self._running = True
         if AUDIO_AVAILABLE and self.audio.pa:
             self.audio.start(self.send_audio_chunk)
-            self.audio.set_active_channel(self.active)
+            self.audio.set_active_channel(self.active)  # sync on startup
 
         if self.relay_host:
             ok = self.relay.connect(self.relay_host, self.relay_port)
