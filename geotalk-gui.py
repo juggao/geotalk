@@ -147,6 +147,14 @@ _BEEP_EMERGENCY: bytes = _synth_pcm([
     (1400, 0.12, 0.80),
     (960,  0.10, 0.80),
 ])
+# Roger tone: three short descending beeps played on PTT release
+_BEEP_ROGER: bytes = _synth_pcm([
+    (1320, 0.08, 0.45),
+    (0,    0.03, 0.0),
+    (1100, 0.08, 0.45),
+    (0,    0.03, 0.0),
+    (880,  0.08, 0.45),
+])
 
 
 def _play_beep(pcm: bytes, rate: int = 22050) -> None:
@@ -1196,6 +1204,7 @@ class GeoTalkGUI:
             return
         self._ptt_pressed = False
         result = self.gt.ptt_release()
+        self.gt.send_roger_tone()
         self._ptt_btn.configure(bg=P["ptt_idle"], fg=P["red_dim"],
                                 highlightbackground=P["red_dim"])
         self._prompt_lbl.configure(fg=P["amber"])

@@ -2403,6 +2403,74 @@ class GeoTalk:
         self.audio.release_ptt()
         return f"{DM}[PTT OFF]{R}"
 
+    def send_roger_tone(self) -> None:
+        """Synthesise a roger tone and transmit it on the active channel.
+        Three descending beeps (1320 → 1100 → 880 Hz, 80 ms each) at 48 kHz,
+        encoded with Opus if available, then sent via the normal audio path.
+        Runs in a daemon thread so it never blocks the caller."""
+        if not self.active:
+            return
+        if not AUDIO_AVAILABLE or not self.audio.pa:
+            return
+        if not self.audio._running:
+            return
+
+        channel = self.active   # snapshot — may change while tone plays
+
+        def _tx():
+            rate    = AUDIO_RATE          # 48 000 Hz
+            chunk   = AUDIO_CHUNK         # 960 samples = 20 ms
+            frame_b = chunk * 2           # bytes per mono int16 frame
+
+            # Build PCM for the full tone at 48 kHz
+            notes = [
+                (1320, 0.08, 0.45),
+                (0,    0.03, 0.0),
+                (1100, 0.08, 0.45),
+                (0,    0.03, 0.0),
+                (880,  0.08, 0.45),
+            ]
+            pcm_frames = []
+            for freq, dur, vol in notes:
+                n = int(rate * dur)
+                for i in range(n):
+                    if freq == 0:
+                        pcm_frames.append(0)
+                    else:
+                        env = 1.0 if i < n * 0.90 else (n - i) / (n * 0.10)
+                        pcm_frames.append(
+                            int(vol * env * math.sin(2 * math.pi * freq * i / rate)
+                                * 32767))
+
+            # Pack into bytes and split into 960-sample (20 ms) chunks
+            raw = struct.pack(f"<{len(pcm_frames)}h", *pcm_frames)
+
+            seq = self.audio._seq
+            pos = 0
+            while pos < len(raw):
+                frame = raw[pos : pos + frame_b]
+                if len(frame) < frame_b:
+                    frame += b"\x00" * (frame_b - len(frame))
+                pos += frame_b
+
+                if self.audio._opus_enc:
+                    try:
+                        audio = self.audio._opus_enc.encode(frame, chunk)
+                    except Exception:
+                        audio = frame
+                else:
+                    audio = frame
+
+                pkt = encode_audio(self.nick, channel, seq, audio,
+                                   codec="opus" if self.audio._opus_enc else "pcm")
+                self._send(channel, pkt)
+                seq += 1
+                time.sleep(chunk / rate)   # pace to real-time
+
+            self.audio._seq = seq
+
+        threading.Thread(target=_tx, daemon=True, name="roger-tone").start()
+
     def mute_toggle(self) -> str:
         """Toggle incoming audio mute on/off."""
         if not AUDIO_AVAILABLE or not self.audio.pa:
