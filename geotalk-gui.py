@@ -1746,19 +1746,75 @@ class GeoTalkGUI:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    root = tk.Tk()
+    root = tk.Tk(className="geotalk-gui")
     root.title("GeoTalk")
 
-    # Window icon (amber diamond drawn as a tiny bitmap)
+    # ── Application icon ──────────────────────────────────────────────────────
+    # 48×48 RGBA PNG encoded as base64 — amber ◈ radio diamond on dark bg.
+    # Embedded directly so no external file dependency is needed at runtime.
+    _ICON_B64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAABzUlEQVR42u2ZvUrDUBzF"
+        "M9lJ7SAWurnoIIIWI9Kh4GYnaZ/ALumk0EJLRwdx6StUyVIQpYKlU0EcfI1OTj6G58o"
+        "JXAShNfcz5A8/aG4aOIfc/0dvg8CB+IoPO2AMpqAHwsC3gOh9ENHII2iBkg/CK7+uj0"
+        "AfvINb598GBL6AAahJa2ugAWJwD85dFX/MbfMAZqALDqT7J2AIJqBpQ+APS3xvj0aewQ"
+        "hcSPd2wQ0TvGlafIcs+0wV3IE5aIMi13doYmJkO0niP8kqJsrgCnxwS21Lb2LInAhNiX"
+        "8iq5oogEvwRhNFKSdiVqeSCfGn5D8mApoQb6ItrTdYYlvaxc+ut2aCFCYK3E7zJLFZYv"
+        "tsdqF28QpMlJnYo6TEstmJjt0zIl6BiSpLbFdaE2V3aky8AhMRm11Nmp3GRsWnMcFmJz"
+        "r2QJ5itYpf39isCxSaiDg7VXh9plv8gigxwdnpVfu2kcTX5c8qc8KI+ORZ6ybSiLduQo"
+        "V4ayZUijduQod4YyZ0ijdiwnsD3m+hTCRxJspoJhpZJkaJTAxzLozTtky4Jd7WT0pnTD"
+        "gj3uSxihMmnBWv82jRCRPeiFd5vO6aCb/Ep/mLyVUTQR555JHHn/EN+tDUzsw76ZsAAAA"
+        "ASUVORK5CYII="
+    )
+
     try:
-        icon = tk.PhotoImage(width=32, height=32)
-        for y in range(32):
-            for x in range(32):
-                if abs(x - 16) + abs(y - 16) < 12:
-                    icon.put("#e8a030", (x, y))
-                else:
-                    icon.put("#0d0e0f", (x, y))
-        root.iconphoto(True, icon)
+        _icon_img  = tk.PhotoImage(data=_ICON_B64)
+        root.iconphoto(True, _icon_img)
+    except Exception:
+        pass
+
+    # Install icon + .desktop file so Ubuntu's GNOME Shell / Unity shows the
+    # icon in the launcher/taskbar when the app is running.
+    # This runs once per user; harmless if the files already exist.
+    try:
+        import base64 as _b64, os as _os, sys as _sys
+        _icon_dir  = _os.path.expanduser("~/.local/share/icons")
+        _desk_dir  = _os.path.expanduser("~/.local/share/applications")
+        _icon_path = _os.path.join(_icon_dir, "geotalk.png")
+        _desk_path = _os.path.join(_desk_dir, "geotalk.desktop")
+        _script    = _os.path.abspath(_sys.argv[0])
+
+        _os.makedirs(_icon_dir, exist_ok=True)
+        _os.makedirs(_desk_dir, exist_ok=True)
+
+        if not _os.path.exists(_icon_path):
+            with open(_icon_path, "wb") as _f:
+                _f.write(_b64.b64decode(_ICON_B64))
+
+        _desk_content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=GeoTalk\n"
+            "Comment=Geo-grouped pseudo-HAM radio & text\n"
+            f"Exec=python3 {_script}\n"
+            f"Icon={_icon_path}\n"
+            "Terminal=false\n"
+            "Categories=Network;HamRadio;\n"
+            "StartupWMClass=geotalk-gui\n"
+        )
+        _need_write = True
+        if _os.path.exists(_desk_path):
+            with open(_desk_path) as _f:
+                _need_write = _f.read() != _desk_content
+        if _need_write:
+            with open(_desk_path, "w") as _f:
+                _f.write(_desk_content)
+    except Exception:
+        pass
+
+    # Set WM_CLASS so GNOME Shell matches this window to the .desktop entry
+    # and shows the correct icon in the top bar / taskbar.
+    try:
+        root.tk.call("wm", "attributes", ".", "-type", "normal")
     except Exception:
         pass
 
