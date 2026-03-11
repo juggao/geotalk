@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relayd.py — GeoTalk Relay Daemon  v2.3.3
+geotalk-relayd.py — GeoTalk Relay Daemon  v2.5.0
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Drop-in replacement for geotalk-relay.py that runs as a proper
@@ -77,7 +77,7 @@ from collections import defaultdict, deque
 # VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "2.3.3"
+VERSION  = "2.5.0"
 MAGIC    = b"GT"
 BUF_SIZE = 65536
 
@@ -1013,8 +1013,8 @@ class RelayDaemon:
                 print(f"{DM}{_ts()}{R} {label:<8} "
                       f"{nick or addr[0]} → {CY}#{postal}{R}{preview}")
                 self._log_line(line)
-            self._logf("%s nick=%s channel=%s",
-                       PKT_NAMES.get(ptype, hex(ptype)), nick, postal)
+                self._logf("%s nick=%s channel=%s",
+                           PKT_NAMES.get(ptype, hex(ptype)), nick, postal)
             return
 
         if ptype == PKT_BBS_POST:
