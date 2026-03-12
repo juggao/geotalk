@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-gui.py — GeoTalk Desktop GUI  v2.5.0
+geotalk-gui.py — GeoTalk Desktop GUI  v2.7.0
 A tkinter frontend for the GeoTalk radio-over-IP client.
 
 Layout
@@ -625,8 +625,35 @@ class GeoTalkGUI:
         self._hist_pos = -1
 
         # Messages area — expands to fill remaining space
+        # Inner horizontal frame: msg pane (expand) + nick sidebar (fixed)
         msg_frame = tk.Frame(right, bg=P["bg"])
         msg_frame.pack(side="top", fill="both", expand=True)
+
+        # Nick sidebar — right side, fixed width
+        tk.Frame(msg_frame, bg=P["border"], width=1).pack(side="right", fill="y")
+        nick_sidebar = tk.Frame(msg_frame, bg=P["bg2"], width=150)
+        nick_sidebar.pack(side="right", fill="y")
+        nick_sidebar.pack_propagate(False)
+        self._nick_sidebar = nick_sidebar
+
+        tk.Label(nick_sidebar, text="USERS", bg=P["bg2"], fg=P["amber_dim"],
+                 font=("Courier", 8, "bold"), anchor="w", padx=8, pady=4
+                 ).pack(fill="x")
+        tk.Frame(nick_sidebar, bg=P["border"], height=1).pack(fill="x", padx=6)
+
+        self._nick_list = tk.Listbox(
+            nick_sidebar, bg=P["bg2"], fg=P["text"],
+            selectbackground=P["amber_dim"], selectforeground=P["amber_pale"],
+            relief="flat", borderwidth=0, highlightthickness=0,
+            font=("Courier", 10), activestyle="none", exportselection=False)
+        self._nick_list.pack(fill="both", expand=True, padx=4, pady=4)
+        self._nick_list.bind("<<ListboxSelect>>", self._on_nick_select)
+        self._nick_list.bind("<space>",            lambda e: "break")
+        self._nick_list.bind("<KeyRelease-space>", lambda e: "break")
+        self._nick_entries: list[tuple[str, str]] = []  # (nick, channel_key) rows
+
+        # Vertical separator between nick sidebar and message pane
+        tk.Frame(msg_frame, bg=P["border"], width=1).pack(side="right", fill="y")
 
         # Split message area: top = text/BBS/join/system, bottom = voice activity
         self._msg_pane = tk.PanedWindow(
@@ -699,6 +726,11 @@ class GeoTalkGUI:
 
         # Configure text tags
         self._setup_tags()
+
+        # Right-click copy popup on both message panes
+        for _tw in (self._msg_text, self._voice_text):
+            _tw.bind("<Button-3>",        self._on_msg_rightclick)
+            _tw.bind("<Button-2>",        self._on_msg_rightclick)  # macOS middle
 
         # ── Bottom bar — packed on root BEFORE body so body's expand=True
         #    leaves room for it ──────────────────────────────────────────────
@@ -907,6 +939,11 @@ class GeoTalkGUI:
 
         self._sidebar.configure(bg=P["bg2"])
         self._chan_list.configure(
+            bg=P["bg2"], fg=P["text"],
+            selectbackground=P["amber_dim"],
+            selectforeground=P["amber_pale"])
+        self._nick_sidebar.configure(bg=P["bg2"])
+        self._nick_list.configure(
             bg=P["bg2"], fg=P["text"],
             selectbackground=P["amber_dim"],
             selectforeground=P["amber_pale"])
@@ -1664,6 +1701,188 @@ class GeoTalkGUI:
         finally:
             self._chan_refreshing = False
 
+        self._refresh_nicks()
+
+    # ── Nick sidebar ──────────────────────────────────────────────────────────
+
+    def _refresh_nicks(self):
+        """Repopulate the USERS sidebar with a flat deduplicated list of all
+        active nicks across every joined channel.  Own nick excluded.
+        A nick that is currently transmitting is shown in green."""
+        if not self.gt:
+            return
+        now       = time.monotonic()
+        AUDIO_TTL = 2.5
+        USER_TTL  = 300
+
+        seen: dict[str, bool] = {}   # nick → currently_transmitting
+        for ch_key, ch in self.gt.channels.items():
+            for nick in ch.active_users(ttl=USER_TTL):
+                if nick == self.gt.nick:
+                    continue
+                transmitting = (now - self.gt._nick_audio_ts.get(
+                    (nick, ch_key), 0.0)) < AUDIO_TTL
+                seen[nick] = seen.get(nick, False) or transmitting
+
+        new_nicks   = list(seen.keys())
+        new_colours = [P["green"] if seen[n] else P["text"] for n in new_nicks]
+
+        cur_nicks   = list(self._nick_list.get(0, "end"))
+        cur_colours = [self._nick_list.itemcget(i, "foreground")
+                       for i in range(self._nick_list.size())]
+        if new_nicks == cur_nicks and new_colours == cur_colours:
+            return
+
+        self._nick_list.delete(0, "end")
+        self._nick_entries = []
+        for i, (nick, colour) in enumerate(zip(new_nicks, new_colours)):
+            self._nick_list.insert("end", nick)
+            self._nick_list.itemconfig(i, foreground=colour)
+            self._nick_entries.append((nick, ""))
+
+    def _on_nick_select(self, event):
+        """Select a nick → ask for confirmation, then create private channel
+        #A-B (alphabetical), join it, and send an invite to the other nick."""
+        sel = self._nick_list.curselection()
+        if not sel or not self.gt:
+            return
+        idx = sel[0]
+        if idx >= len(self._nick_entries):
+            return
+        other_nick, _ = self._nick_entries[idx]
+        if not other_nick:
+            return
+
+        # ── Confirmation dialog ───────────────────────────────────────────
+        dlg = tk.Toplevel(self.root)
+        dlg.withdraw()
+        dlg.title("Private channel")
+        dlg.resizable(False, False)
+        dlg.configure(bg=P["bg"])
+        dlg.transient(self.root)
+
+        tk.Label(
+            dlg, text=f"Auto join with  {other_nick}",
+            bg=P["bg"], fg=P["amber"], font=("Courier", 12, "bold"),
+            padx=24, pady=16).pack()
+        tk.Label(
+            dlg, text="in a temporary invite channel?",
+            bg=P["bg"], fg=P["text"], font=("Courier", 10),
+            padx=24, pady=0).pack()
+
+        tk.Frame(dlg, bg=P["border"], height=1).pack(fill="x", padx=16, pady=10)
+
+        btn_f = tk.Frame(dlg, bg=P["bg"])
+        btn_f.pack(pady=(0, 16), padx=24)
+
+        confirmed = [False]
+
+        def _yes():
+            confirmed[0] = True
+            dlg.destroy()
+
+        def _no():
+            dlg.destroy()
+
+        tk.Button(
+            btn_f, text="YES", font=("Courier", 10, "bold"),
+            bg=P["green"], fg=P["bg"],
+            activebackground=P["amber"], activeforeground=P["bg"],
+            relief="flat", width=8, cursor="hand2",
+            command=_yes).pack(side="left", padx=(0, 12))
+
+        tk.Button(
+            btn_f, text="NO", font=("Courier", 10),
+            bg=P["bg2"], fg=P["text_dim"],
+            activebackground=P["red"], activeforeground="white",
+            relief="flat", width=8, cursor="hand2",
+            command=_no).pack(side="left")
+
+        dlg.bind("<Return>", lambda e: _yes())
+        dlg.bind("<Escape>", lambda e: _no())
+
+        # Force layout pass, then centre and show
+        dlg.update_idletasks()
+        dw = dlg.winfo_reqwidth()
+        dh = dlg.winfo_reqheight()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        dlg.geometry(f"{dw}x{dh}+{rx + (rw - dw)//2}+{ry + (rh - dh)//2}")
+        dlg.deiconify()
+        dlg.grab_set()
+        dlg.focus_set()
+
+        self.root.wait_window(dlg)
+
+        if not confirmed[0]:
+            self._nick_list.selection_clear(0, "end")
+            return
+
+        # Move keyboard focus to the read-only message pane so the listbox
+        # no longer holds it — prevents space from re-triggering the dialog.
+        self._nick_list.selection_clear(0, "end")
+        self._msg_text.focus_set()
+
+        # ── Create & join the private channel ────────────────────────────
+        my_nick = self.gt.nick or "me"
+        a, b = sorted([my_nick, other_nick])
+        priv_ch = f"{a}-{b}"
+
+        result = self.gt.switch_channel(priv_ch)
+        self._ingest_result(result)
+        self._refresh_channels()
+
+        # Invite the other nick via a text message on any shared channel
+        invite = f"📩 {other_nick}: join #{priv_ch} for a private chat"
+        for ch_key, ch in self.gt.channels.items():
+            if ch_key == priv_ch:
+                continue
+            if other_nick in ch.active_users():
+                self.gt.send_text(invite, ch_key)
+                self._append_sys(f"Invited {other_nick} → #{priv_ch}")
+                break
+
+    # ── Right-click copy popup ────────────────────────────────────────────────
+
+    def _on_msg_rightclick(self, event):
+        """Show a minimal 'Copy' popup at the cursor position."""
+        widget = event.widget
+
+        # If nothing is selected in this widget, select the word under cursor
+        try:
+            widget.selection_get()          # raises if nothing selected
+        except tk.TclError:
+            # No selection — try to select the clicked line for convenience
+            idx = widget.index(f"@{event.x},{event.y} linestart")
+            end = widget.index(f"@{event.x},{event.y} lineend")
+            widget.tag_remove("sel", "1.0", "end")
+            widget.tag_add("sel", idx, end)
+
+        # Build popup
+        menu = tk.Menu(self.root, tearoff=False,
+                       bg=P["bg2"], fg=P["text"],
+                       activebackground=P["amber_dim"],
+                       activeforeground=P["amber_pale"],
+                       relief="flat", borderwidth=1,
+                       font=("Courier", 10))
+        menu.add_command(label="  Copy  ", command=lambda: self._copy_selection(widget))
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_selection(self, widget):
+        """Copy selected text from widget to clipboard."""
+        try:
+            text = widget.selection_get()
+        except tk.TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
     # ── Message display ───────────────────────────────────────────────────────
 
     # Tags that belong in the voice activity pane
@@ -1752,6 +1971,7 @@ class GeoTalkGUI:
         if "[voice]" in lo:
             self._append_line(line, "voice")
             self._refresh_channels()
+            self._refresh_nicks()
             self._beep_for_voice(line)
         elif "→" in line and "online" in lo:
             self._append_line(line, "ping")
@@ -1762,8 +1982,23 @@ class GeoTalkGUI:
             self._append_line(line, "bbs")
         elif any(x in lo for x in ("joined", "left", "active →")):
             self._append_line(line, "joined")
-            # Channel list changes on join/leave — refresh immediately
             self._refresh_channels()
+            # If a nick left a private invite channel, auto-leave it too
+            if "left #" in lo and self.gt:
+                m = re.search(r"left #(\S+)", line, re.IGNORECASE)
+                if m:
+                    ch_key = m.group(1).upper()
+                    if (ch_key in (k.upper() for k in self.gt.channels)
+                            and self.gt._is_invite_channel(ch_key)):
+                        real_key = next(k for k in self.gt.channels
+                                        if k.upper() == ch_key)
+                        ch = self.gt.channels.get(real_key)
+                        if ch and not ch.active_users():
+                            result = self.gt.leave_channel(real_key)
+                            self._append_sys(
+                                f"Private channel #{real_key} closed — partner left")
+                            self._ingest_result(result)
+                            self._refresh_channels()
         elif any(x in lo for x in ("error", "failed", "invalid")):
             self._append_line(line, "error")
         else:
@@ -1799,7 +2034,8 @@ class GeoTalkGUI:
             _play_beep(_BEEP_NORMAL)
 
     def _parse_text_msg(self, line: str):
-        """Try to render a GeoTalk text message with coloured parts."""
+        """Try to render a GeoTalk text message with coloured parts.
+        Also detects private-channel invites and auto-joins them."""
         # Format: "HH:MM [NICK] (region) #chan: body"
         m = re.match(r"^(\d{2}:\d{2})\s+\[([^\]]+)\]\s+(\([^)]*\))?\s*(#\S+)?:?\s*(.*)", line)
         if not m:
@@ -1817,6 +2053,18 @@ class GeoTalkGUI:
         t.insert("end", (body or line) + "\n", "body")
         t.configure(state="disabled")
         t.see("end")
+        # Auto-join: "📩 NICK: join #CHANNEL for a private chat"
+        if body and self.gt:
+            _inv = re.match(
+                r"📩\s+(\S+):\s+join\s+#(\S+)\s+for a private chat",
+                body, re.IGNORECASE)
+            if _inv and _inv.group(1).upper() == (self.gt.nick or "").upper():
+                _ch = _inv.group(2)
+                if _ch.upper() not in (k.upper() for k in self.gt.channels):
+                    result = self.gt.switch_channel(_ch)
+                    self._ingest_result(result)
+                    self._append_sys(f"Auto-joined #{_ch} — invited by {nick}")
+                    self._refresh_channels()
 
     # ── Status bar refresh ────────────────────────────────────────────────────
 

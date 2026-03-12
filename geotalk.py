@@ -54,7 +54,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION      = "2.5.0"
+VERSION      = "2.7.0"
 DEFAULT_PORT   = 5073          # GeoTalk default UDP port
 MCAST_GROUP    = "239.73.0."   # Multicast base: 239.73.<postal-hash-byte>.<sub>
 BUFFER_SIZE    = 65536
@@ -2090,6 +2090,7 @@ class GeoTalk:
         # Maps channel key → monotonic time of last received audio frame.
         # Used by the GUI to light up channels that are currently receiving audio.
         self._audio_active_ts: dict[str, float] = {}
+        self._nick_audio_ts:   dict[tuple, float] = {}  # (nick, channel_key) → last audio time
         # Throttle [VOICE] stdout prints — at most once per 2 s per (nick, channel)
         # so stream daemons sending 50 pkt/s don't flood the terminal / GUI queue.
         self._voice_print_ts: dict[tuple, float] = {}
@@ -2260,6 +2261,17 @@ class GeoTalk:
         elif was_active:
             result += f"\n{YL}No more channels — join one with #POSTCODE{R}"
         return result
+
+    def _is_invite_channel(self, key: str) -> bool:
+        """Return True if key is a private invite channel created by nick selection.
+        Format: NICK1-NICK2 where both parts are non-empty strings with no
+        postal-code digits at the start (distinguishes from e.g. FREQ: or 5911AB)."""
+        parts = key.split("-", 1)
+        if len(parts) != 2:
+            return False
+        a, b = parts
+        # Both parts must be non-empty and not purely numeric (postal codes)
+        return bool(a) and bool(b) and not a.isdigit() and not b.isdigit()
 
     def _set_active(self, key: str | None):
         """Set the active channel and synchronise the audio engine in one step.
@@ -2863,22 +2875,37 @@ class GeoTalk:
         if nick == self.nick:
             return   # suppress own echo for other packet types
 
-        # ── LEAVE: remove the departing nick from all matching channels ────
+        # ── LEAVE: remove the departing nick from the matching channel ────
         if pkt_type == "leave":
             ts = time.strftime("%H:%M")
+            leave_key = pkt.get("p", "").strip().upper()
             if hint_key:
                 candidate_keys = [hint_key] if hint_key in self.channels else []
             else:
-                candidate_keys = list(self.channels.keys())
+                # Match only the channel the LEAVE was sent on
+                candidate_keys = [k for k in self.channels
+                                  if k.upper() == leave_key] if leave_key else list(self.channels.keys())
             for key in candidate_keys:
                 ch = self.channels.get(key)
                 if ch:
+                    was_known = nick in ch.users
                     ch.users.pop(nick, None)
-                    sys.stdout.write(
-                        f"\r{DM}{ts}{R} {DM}← {nick} left "
-                        f"#{ch.pattern.display()}{R}\n")
-                    sys.stdout.flush()
-                    self._redraw_prompt()
+                    if was_known:
+                        sys.stdout.write(
+                            f"\r{DM}{ts}{R} {DM}← {nick} left "
+                            f"#{ch.pattern.display()}{R}\n")
+                        sys.stdout.flush()
+                        self._redraw_prompt()
+                    # If this is a private invite channel and the partner left,
+                    # auto-leave and return to the previous channel.
+                    if was_known and self._is_invite_channel(key) and not ch.active_users():
+                        result = self.leave_channel(key)
+                        sys.stdout.write(
+                            f"\r{DM}{ts}{R} {YL}[PRIVATE]{R} "
+                            f"{nick} left — closing #{ch.pattern.display()}\n")
+                        sys.stdout.flush()
+                        self._redraw_prompt()
+                    break   # one LEAVE packet → one channel
             return
 
         # ── JOIN: record the arriving nick in all matching channels ────────
@@ -3031,11 +3058,26 @@ class GeoTalk:
         printed = False
 
         if pkt["type"] == "text":
+            msg = pkt.get("t", "")
             sys.stdout.write(
                 f"\r{DM}{ts}{R} {B}{CY}[{nick}]{R} "
                 f"{DM}({region}){R} "
-                f"#{pat.display()}: {pkt.get('t','')}\n")
+                f"#{pat.display()}: {msg}\n")
             printed = True
+            # Auto-join private channel invites addressed to us.
+            # Format: "\U0001f4e9 NICK: join #CHANNEL for a private chat"
+            _inv = re.match(
+                r"\U0001f4e9\s+(\S+):\s+join\s+#(\S+)\s+for a private chat",
+                msg, re.IGNORECASE)
+            if _inv and _inv.group(1).upper() == self.nick.upper():
+                _ch = _inv.group(2)
+                if _ch.upper() not in (k.upper() for k in self.channels):
+                    self.switch_channel(_ch)
+                    sys.stdout.write(
+                        f"\r{DM}{ts}{R} {GR}[AUTO-JOIN]{R} "
+                        f"Private channel #{_ch} — invited by {nick}\n")
+                    sys.stdout.flush()
+                    self._redraw_prompt()
 
         elif pkt["type"] == "audio":
             if self._ptt_held:
@@ -3043,6 +3085,7 @@ class GeoTalk:
             if pat.key in self._muted_channels:
                 return   # this channel is individually muted
             self._audio_active_ts[pat.key] = time.monotonic()
+            self._nick_audio_ts[(nick, pat.key)] = time.monotonic()
             self.audio.feed_audio(pkt.get("audio", b""),
                                    channel_key=pat.key,
                                    nick=nick,
@@ -3236,6 +3279,16 @@ class GeoTalk:
         self._running = False
         self.audio.stop()
         self.mcast.close_all()
+        # Send explicit LEAVE for every joined channel before closing the relay
+        # socket so the relay can fan them out with correct per-channel "p"
+        # fields.  Without this the relay detects a dead connection and calls
+        # unsubscribe_all, which fans out the same packet to all channels —
+        # causing spurious "left" messages on the receiver side.
+        if self.relay_mode and self.relay.is_connected():
+            for key in list(self.channels.keys()):
+                self.relay.unsubscribe(self.nick, key)
+                for sub_key in self._glob_socks.get(key, []):
+                    self.relay.unsubscribe(self.nick, sub_key)
         self.relay.close()
 
 

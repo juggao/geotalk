@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-timed.py — GeoTalk Time Announcement Daemon  v2.3.3
+geotalk-timed.py — GeoTalk Time Announcement Daemon  v2.7.0
 Author: René Oudeweg / Claude
 ──────────────────────────────────────────────────────────────────────────────
 Connects to a GeoTalk relay as a bot on channel #TIME.  On a configurable
@@ -67,7 +67,7 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────────────────────────
 # VERSION
 # ─────────────────────────────────────────────────────────────────────────────
-VERSION = "2.3.3"
+VERSION = "2.7.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WIRE PROTOCOL  (matches geotalk.py / geotalk-relayd.py exactly)
@@ -586,8 +586,7 @@ class TimedClient:
             self._send(pkt)
             self._seq += 1
 
-            # Pace frames to real-time so the receiver's jitter buffer
-            # is not flooded (and doesn't have to buffer the whole utterance)
+            # Pace frames to real-time
             target = t0 + (i + 1) * frame_dur
             sleep  = target - time.monotonic()
             if sleep > 0:

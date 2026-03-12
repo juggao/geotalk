@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-geotalk-relayd.py — GeoTalk Relay Daemon  v2.5.0
+geotalk-relayd.py — GeoTalk Relay Daemon  v2.7.0
 Author: René Oudeweg / Claude
 ─────────────────────────────────────────────────────────
 Drop-in replacement for geotalk-relay.py that runs as a proper
@@ -77,7 +77,7 @@ from collections import defaultdict, deque
 # VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "2.5.0"
+VERSION  = "2.7.0"
 MAGIC    = b"GT"
 BUF_SIZE = 65536
 
@@ -172,6 +172,23 @@ def _fmt_bytes(n: int) -> str:
 
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
+
+def _rewrite_p(data: bytes, new_p: str) -> bytes:
+    """Return a copy of a GeoTalk packet with the 'p' field replaced by new_p.
+    Wire format: MAGIC(2) + type(1) + json_len(2) + JSON + optional tail."""
+    if len(data) < 5 or data[:2] != MAGIC:
+        return data
+    pkt_type = data[2]
+    json_len = struct.unpack("!H", data[3:5])[0]
+    tail     = data[5 + json_len:]
+    try:
+        payload = json.loads(data[5:5 + json_len])
+    except Exception:
+        return data
+    payload["p"] = new_p
+    new_json = json.dumps(payload, separators=(",", ":")).encode()
+    return MAGIC + bytes([pkt_type]) + struct.pack("!H", len(new_json)) + new_json + tail
+
 
 def decode_header(data: bytes) -> dict | None:
     if len(data) < 5 or data[:2] != MAGIC:
@@ -959,19 +976,38 @@ class RelayDaemon:
             return
 
         if ptype == PKT_LEAVE:
-            # Fan out the LEAVE to all channels this client is on so that
-            # other subscribers can remove the nick from their user lists
-            # immediately — before we unsubscribe and lose the channel list.
-            client = self.registry._clients.get(addr)
-            if client:
+            # If the packet names a specific channel in "p", fan out only to
+            # that channel's subscribers and unsubscribe just that channel.
+            # This handles clean per-channel /leave from the client.
+            # If "p" is absent (legacy disconnect), fan out all channels and
+            # unsubscribe everything.
+            leave_ch = postal   # already stripped/uppercased above
+            client   = self.registry._clients.get(addr)
+            if leave_ch and client and leave_ch in client.channels:
+                # Single-channel leave
+                self._fanout(data, leave_ch, exclude=addr)
+                with self.registry._lock:
+                    client.channels.discard(leave_ch)
+                    self.registry._channels[leave_ch].discard(addr)
+                    # Remove the client record entirely if no channels remain
+                    if not client.channels:
+                        self.registry._clients.pop(addr, None)
+            elif client:
+                # Full disconnect fallback: fan out per channel with rewritten p
                 for ch in list(client.channels):
-                    self._fanout(data, ch, exclude=addr)
-            self.registry.unsubscribe_all(addr)
-            line = f"-LEAVE {nick or addr[0]}"
+                    try:
+                        rewritten = _rewrite_p(data, ch)
+                    except Exception:
+                        rewritten = data
+                    self._fanout(rewritten, ch, exclude=addr)
+                self.registry.unsubscribe_all(addr)
+            line = f"-LEAVE {nick or addr[0]} #{leave_ch or '*'}"
             if not self.quiet:
-                print(f"{DM}{_ts()}{R} {YL}-LEAVE{R} {YL}{nick or addr[0]}{R}")
+                print(f"{DM}{_ts()}{R} {YL}-LEAVE{R} {YL}{nick or addr[0]}{R} "
+                      f"{CY}#{leave_ch or '*'}{R}")
             self._log_line(line)
-            self._logf("LEAVE nick=%s addr=%s:%s", nick, addr[0], addr[1])
+            self._logf("LEAVE nick=%s addr=%s:%s channel=%s",
+                       nick, addr[0], addr[1], leave_ch or "*")
             return
 
         if ptype == PKT_SCAN_REQ:
