@@ -527,7 +527,8 @@ class GeoTalkGUI:
 
         # ── Main body ─────────────────────────────────────────────────────────
         body = tk.Frame(root, bg=P["bg"])
-        body.pack(fill="both", expand=True)
+        # body.pack() is called after the bottom bar so side="bottom" widgets
+        # reserve their space before body's expand=True claims the rest.
         self._body = body
 
         # Left sidebar — channels
@@ -599,33 +600,13 @@ class GeoTalkGUI:
         right = tk.Frame(body, bg=P["bg"])
         right.pack(side="left", fill="both", expand=True)
 
-        # Messages area
-        msg_frame = tk.Frame(right, bg=P["bg"])
-        msg_frame.pack(fill="both", expand=True)
-
-        self._msg_text = tk.Text(
-            msg_frame, bg=P["bg"], fg=P["text"], state="disabled",
-            relief="flat", borderwidth=0, font=("Courier", 10),
-            wrap="word", padx=10, pady=8, cursor="arrow",
-            highlightthickness=0)
-        self._msg_text.pack(side="left", fill="both", expand=True)
-
-        msg_scroll = tk.Scrollbar(msg_frame, command=self._msg_text.yview,
-                                  bg=P["bg2"], troughcolor=P["bg"],
-                                  activebackground=P["amber_dim"], relief="flat",
-                                  width=8)
-        msg_scroll.pack(side="right", fill="y")
-        self._msg_text.configure(yscrollcommand=msg_scroll.set)
-
-        # Configure text tags
-        self._setup_tags()
-
-        # Separator above input
-        tk.Frame(right, bg=P["border2"], height=1).pack(fill="x")
+        # Separator above input and REPL — packed first so expand=True in
+        # msg_frame doesn't swallow them
+        tk.Frame(right, bg=P["border2"], height=1).pack(side="bottom", fill="x")
 
         # REPL input row
         repl_f = tk.Frame(right, bg=P["bg3"], pady=0)
-        repl_f.pack(fill="x")
+        repl_f.pack(side="bottom", fill="x")
 
         self._prompt_lbl = tk.Label(
             repl_f, text="➤", bg=P["bg3"], fg=P["amber"],
@@ -643,11 +624,88 @@ class GeoTalkGUI:
         self._repl_history = []
         self._hist_pos = -1
 
-        # ── Bottom bar ────────────────────────────────────────────────────────
-        tk.Frame(root, bg=P["border"], height=1).pack(fill="x")
+        # Messages area — expands to fill remaining space
+        msg_frame = tk.Frame(right, bg=P["bg"])
+        msg_frame.pack(side="top", fill="both", expand=True)
+
+        # Split message area: top = text/BBS/join/system, bottom = voice activity
+        self._msg_pane = tk.PanedWindow(
+            msg_frame, orient="vertical", bg=P["border"],
+            sashwidth=4, sashrelief="flat", handlesize=0)
+        self._msg_pane.pack(fill="both", expand=True)
+
+        # ── Top pane: text messages, BBS, join/leave, system ─────────────────
+        top_frame = tk.Frame(self._msg_pane, bg=P["bg"])
+
+        top_hdr = tk.Label(
+            top_frame, text=" MESSAGES", bg=P["bg2"], fg=P["amber_dim"],
+            font=("Courier", 8), anchor="w", padx=6, pady=2)
+        top_hdr.pack(fill="x")
+        self._top_hdr = top_hdr
+
+        top_inner = tk.Frame(top_frame, bg=P["bg"])
+        top_inner.pack(fill="both", expand=True)
+
+        self._msg_text = tk.Text(
+            top_inner, bg=P["bg"], fg=P["text"], state="disabled",
+            relief="flat", borderwidth=0, font=("Courier", 10),
+            wrap="word", padx=10, pady=6, cursor="arrow",
+            highlightthickness=0)
+        self._msg_text.pack(side="left", fill="both", expand=True)
+
+        msg_scroll = tk.Scrollbar(top_inner, command=self._msg_text.yview,
+                                  bg=P["bg2"], troughcolor=P["bg"],
+                                  activebackground=P["amber_dim"], relief="flat",
+                                  width=8)
+        msg_scroll.pack(side="right", fill="y")
+        self._msg_text.configure(yscrollcommand=msg_scroll.set)
+
+        self._msg_pane.add(top_frame, stretch="always", minsize=80)
+
+        # ── Bottom pane: voice / audio activity ───────────────────────────────
+        bot_frame = tk.Frame(self._msg_pane, bg=P["bg"])
+
+        bot_hdr = tk.Label(
+            bot_frame, text=" VOICE ACTIVITY", bg=P["bg2"], fg=P["green"],
+            font=("Courier", 8), anchor="w", padx=6, pady=2)
+        bot_hdr.pack(fill="x")
+        self._bot_hdr = bot_hdr
+
+        bot_inner = tk.Frame(bot_frame, bg=P["bg"])
+        bot_inner.pack(fill="both", expand=True)
+
+        self._voice_text = tk.Text(
+            bot_inner, bg=P["bg"], fg=P["green"], state="disabled",
+            relief="flat", borderwidth=0, font=("Courier", 10),
+            wrap="word", padx=10, pady=4, cursor="arrow",
+            highlightthickness=0)
+        self._voice_text.pack(side="left", fill="both", expand=True)
+
+        voice_scroll = tk.Scrollbar(bot_inner, command=self._voice_text.yview,
+                                    bg=P["bg2"], troughcolor=P["bg"],
+                                    activebackground=P["amber_dim"], relief="flat",
+                                    width=8)
+        voice_scroll.pack(side="right", fill="y")
+        self._voice_text.configure(yscrollcommand=voice_scroll.set)
+
+        self._msg_pane.add(bot_frame, stretch="never", minsize=60)
+
+        # Set sash so top pane gets ~70 % on first render
+        def _set_sash():
+            h = self._msg_pane.winfo_height()
+            if h > 10:
+                self._msg_pane.sash_place(0, 0, max(80, int(h * 0.70)))
+        self.root.after(100, _set_sash)
+
+        # Configure text tags
+        self._setup_tags()
+
+        # ── Bottom bar — packed on root BEFORE body so body's expand=True
+        #    leaves room for it ──────────────────────────────────────────────
+        tk.Frame(root, bg=P["border"], height=1).pack(side="bottom", fill="x")
 
         bottom = tk.Frame(root, bg=P["bg"], height=72)
-        bottom.pack(fill="x")
+        bottom.pack(side="bottom", fill="x")
         bottom.pack_propagate(False)
 
         # PTT button — large, left side
@@ -734,21 +792,25 @@ class GeoTalkGUI:
             font=("Courier", 8), justify="right", anchor="e")
         self._transport_lbl.pack(side="right", padx=14)
 
+        # Now pack body — after all side="bottom" widgets are registered,
+        # expand=True fills only the space that remains above them.
+        body.pack(fill="both", expand=True)
+
     def _setup_tags(self):
-        t = self._msg_text
-        t.tag_configure("ts",       foreground=P["text_dim"],  font=("Courier", 9))
-        t.tag_configure("nick",     foreground=P["amber_pale"], font=("Courier", 10, "bold"))
-        t.tag_configure("region",   foreground=P["text_dim"],  font=("Courier", 9, "italic"))
-        t.tag_configure("body",     foreground=P["text"],      font=("Courier", 10))
-        t.tag_configure("voice",    foreground=P["green"],     font=("Courier", 10))
-        t.tag_configure("system",   foreground=P["amber_dim"], font=("Courier", 9, "italic"))
-        t.tag_configure("error",    foreground=P["red"],       font=("Courier", 10))
-        t.tag_configure("success",  foreground=P["green"],     font=("Courier", 10))
-        t.tag_configure("joined",   foreground=P["blue"],      font=("Courier", 10))
-        t.tag_configure("scan",     foreground=P["scan"],      font=("Courier", 10))
-        t.tag_configure("bbs",      foreground=P["mute"],      font=("Courier", 10, "italic"))
-        t.tag_configure("chan_hdr", foreground=P["amber"],     font=("Courier", 11, "bold"))
-        t.tag_configure("ping",     foreground=P["text_dim"],  font=("Courier", 9, "italic"))
+        for t in (self._msg_text, self._voice_text):
+            t.tag_configure("ts",       foreground=P["text_dim"],  font=("Courier", 9))
+            t.tag_configure("nick",     foreground=P["amber_pale"], font=("Courier", 10, "bold"))
+            t.tag_configure("region",   foreground=P["text_dim"],  font=("Courier", 9, "italic"))
+            t.tag_configure("body",     foreground=P["text"],      font=("Courier", 10))
+            t.tag_configure("voice",    foreground=P["green"],     font=("Courier", 10))
+            t.tag_configure("system",   foreground=P["amber_dim"], font=("Courier", 9, "italic"))
+            t.tag_configure("error",    foreground=P["red"],       font=("Courier", 10))
+            t.tag_configure("success",  foreground=P["green"],     font=("Courier", 10))
+            t.tag_configure("joined",   foreground=P["blue"],      font=("Courier", 10))
+            t.tag_configure("scan",     foreground=P["scan"],      font=("Courier", 10))
+            t.tag_configure("bbs",      foreground=P["mute"],      font=("Courier", 10, "italic"))
+            t.tag_configure("chan_hdr", foreground=P["amber"],     font=("Courier", 11, "bold"))
+            t.tag_configure("ping",     foreground=P["text_dim"],  font=("Courier", 9, "italic"))
 
     # ── Theme switching ───────────────────────────────────────────────────────
 
@@ -863,6 +925,9 @@ class GeoTalkGUI:
             activebackground=P["scan"], activeforeground=P["bg"])
 
         self._msg_text.configure(bg=P["bg"], fg=P["text"])
+        self._voice_text.configure(bg=P["bg"], fg=P["green"])
+        self._top_hdr.configure(bg=P["bg2"], fg=P["amber_dim"])
+        self._bot_hdr.configure(bg=P["bg2"], fg=P["green"])
         self._setup_tags()   # repaint all text tags
 
         self._prompt_lbl.configure(bg=P["bg3"], fg=P["amber"])
@@ -1601,8 +1666,11 @@ class GeoTalkGUI:
 
     # ── Message display ───────────────────────────────────────────────────────
 
+    # Tags that belong in the voice activity pane
+    _VOICE_TAGS = {"voice", "ping"}
+
     def _append_line(self, text: str, tag: str = "body"):
-        t = self._msg_text
+        t = self._voice_text if tag in self._VOICE_TAGS else self._msg_text
         t.configure(state="normal")
         t.insert("end", text + "\n", tag)
         t.configure(state="disabled")
