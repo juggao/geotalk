@@ -499,6 +499,15 @@ class GeoTalkGUI:
             command=self._show_about)
         self._hdr_right.pack(side="right", padx=14)
 
+        # Theme toggle button — rightmost
+        self._theme_btn = tk.Button(
+            hdr, text="☾", font=("Courier", 12),
+            bg=P["bg"], fg=P["amber_dim"],
+            activebackground=P["bg2"], activeforeground=P["amber"],
+            relief="flat", cursor="hand2", bd=0,
+            command=self._toggle_theme)
+        self._theme_btn.pack(side="right", padx=(0, 4))
+
         # VU meter — 8-segment bar left of theme button
         # Canvas is 3 px per segment + 1 px gap, 8 segments = 31 px wide, 14 px tall
         self._vu_canvas = tk.Canvas(
@@ -512,15 +521,6 @@ class GeoTalkGUI:
             rid = self._vu_canvas.create_rectangle(
                 x, 0, x + SEG_W, SEG_H, fill=P["bg2"], outline="")
             self._vu_segs.append(rid)
-
-        # Theme toggle button — right side of header
-        self._theme_btn = tk.Button(
-            hdr, text="☾", font=("Courier", 12),
-            bg=P["bg"], fg=P["amber_dim"],
-            activebackground=P["bg2"], activeforeground=P["amber"],
-            relief="flat", cursor="hand2", bd=0,
-            command=self._toggle_theme)
-        self._theme_btn.pack(side="right", padx=(0, 4))
 
         # Separator
         tk.Frame(root, bg=P["border"], height=1).pack(fill="x")
